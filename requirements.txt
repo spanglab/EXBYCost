@@ -3,8 +3,8 @@ biosteam==2.53.9
 thermosteam==0.53.3
 flexsolve==0.5.10
 numpy==2.3.5
-scipy==1.15.3
+scipy
 matplotlib==3.10.8
 pandas==2.2.3
-Pillow==11.1.0
+Pillow
 graphviz==0.21
