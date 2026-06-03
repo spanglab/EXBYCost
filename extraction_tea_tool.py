@@ -577,8 +577,7 @@ cepci_index = {
 # present in the environment (FRED_API_KEY), base prices are escalated
 # to the present using BLS Producer Price Indices; otherwise the cited
 # base prices are used as-is. Free key: fred.stlouisfed.org/docs/api
-_FRED_API_KEY = st.secrets.get('FRED_API_KEY')
-
+_FRED_API_KEY = st.secrets.get('FRED_API_KEY') or os.environ.get('FRED_API_KEY')
 
 @st.cache_data(show_spinner=False, ttl=86400)   # 24-h TTL: daily refresh
 def _load_solvent_prices(api_key, escalate):
@@ -862,7 +861,7 @@ with col1:
     if elec_source.startswith("California"):
         try:
             elec_price, _elec_meta = _load_california_electricity_price(
-                st.secrets.get('EIA_API_KEY'))
+                st.secrets.get('EIA_API_KEY') or os.environ.get('EIA_API_KEY'))
             st.caption(f"Using **${elec_price:.4f}/kWh** "
                        f"({_elec_meta['period']}, EIA CA Industrial)")
         except Exception as _elec_err:
@@ -903,8 +902,8 @@ wage_source = st.sidebar.radio(
 if wage_source.startswith("California"):
     try:
         operator_hourly_wage, _wage_meta = _load_california_operator_wage(
-            st.secrets.get('BLS_API_KEY'),
-            st.secrets.get('FRED_API_KEY'))
+            st.secrets.get('BLS_API_KEY') or os.environ.get('BLS_API_KEY'),
+            st.secrets.get('FRED_API_KEY') or os.environ.get('FRED_API_KEY'))
         if _wage_meta.get('escalated'):
             _period_label = (f"May {_wage_meta['period']} OEWS escalated "
                              f"to {_wage_meta['eci_latest_date']} via ECI")
