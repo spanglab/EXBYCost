@@ -801,11 +801,8 @@ def find_proxy(
             if info and info.smiles:
                 smiles = info.smiles
                 smiles_source = 'chemicals_library'
-            elif verbose:
-                print(f"  [DEBUG] (c) chemicals_library: no SMILES for '{target_name}' (info={info})")
-        except Exception as e:
-            if verbose:
-                print(f"  [DEBUG] (c) chemicals_library('{target_name}') failed: {type(e).__name__}: {e}")
+        except (ValueError, Exception):
+            pass  # Not in local library — continue to network lookups
 
     # (d) chemicals library by CAS
     if smiles is None and cas:
@@ -815,11 +812,8 @@ def find_proxy(
             if info and info.smiles:
                 smiles = info.smiles
                 smiles_source = 'chemicals_library_CAS'
-            elif verbose:
-                print(f"  [DEBUG] (d) chemicals_library_CAS: no SMILES for cas='{cas}' (info={info})")
-        except Exception as e:
-            if verbose:
-                print(f"  [DEBUG] (d) chemicals_library_CAS('{cas}') failed: {type(e).__name__}: {e}")
+        except (ValueError, Exception):
+            pass  # Not in local library — continue to network lookups
 
     # (e) Polymersolubility lookup chain by name
     #     (PubChem REST, ChEBI OLS, NIH CIR)
