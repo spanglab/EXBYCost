@@ -823,9 +823,11 @@ def find_proxy(
             if found and is_valid_smiles(found):
                 smiles = found
                 smiles_source = src
+            elif verbose:
+                print(f"  [DEBUG] (e) lookup_smiles('{target_name}') returned: found={found!r}, src={src!r}, valid={is_valid_smiles(found) if found else 'N/A'}")
         except Exception as e:
             if verbose:
-                print(f"  [DEBUG] (e) lookup_smiles('{target_name}') failed: {type(e).__name__}: {e}")
+                print(f"  [DEBUG] (e) lookup_smiles('{target_name}') raised: {type(e).__name__}: {e}")
 
     # (f) PubChem REST API by CAS
     if smiles is None and cas:
@@ -834,9 +836,11 @@ def find_proxy(
             if found and is_valid_smiles(found):
                 smiles = found
                 smiles_source = 'PubChem_REST_CAS'
+            elif verbose:
+                print(f"  [DEBUG] (f) _lookup_smiles_by_cas('{cas}') returned: {found!r}")
         except Exception as e:
             if verbose:
-                print(f"  [DEBUG] (f) _lookup_smiles_by_cas('{cas}') failed: {type(e).__name__}: {e}")
+                print(f"  [DEBUG] (f) _lookup_smiles_by_cas('{cas}') raised: {type(e).__name__}: {e}")
 
     # (g) PubChem REST API by ChEBI
     if smiles is None and chebi:
@@ -845,9 +849,11 @@ def find_proxy(
             if found and is_valid_smiles(found):
                 smiles = found
                 smiles_source = 'PubChem_REST_ChEBI'
+            elif verbose:
+                print(f"  [DEBUG] (g) _lookup_smiles_by_chebi('{chebi}') returned: {found!r}")
         except Exception as e:
             if verbose:
-                print(f"  [DEBUG] (g) _lookup_smiles_by_chebi('{chebi}') failed: {type(e).__name__}: {e}")
+                print(f"  [DEBUG] (g) _lookup_smiles_by_chebi('{chebi}') raised: {type(e).__name__}: {e}")
 
     # (h) Polymersolubility lookup chain with CAS as search term
     if smiles is None and cas:
@@ -856,9 +862,11 @@ def find_proxy(
             if found and is_valid_smiles(found):
                 smiles = found
                 smiles_source = f'{src}_via_CAS'
+            elif verbose:
+                print(f"  [DEBUG] (h) lookup_smiles('{cas}') returned: found={found!r}, src={src!r}, valid={is_valid_smiles(found) if found else 'N/A'}")
         except Exception as e:
             if verbose:
-                print(f"  [DEBUG] (h) lookup_smiles('{cas}') failed: {type(e).__name__}: {e}")
+                print(f"  [DEBUG] (h) lookup_smiles('{cas}') raised: {type(e).__name__}: {e}")
 
     if smiles is None:
         if verbose:
