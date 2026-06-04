@@ -2,7 +2,7 @@
 BioSTEAM Proxy Compound Finder
 ================================
 For compounds not in the thermosteam/chemicals database, this module:
- 
+
 1. Checks if a compound can be loaded directly by thermosteam
    (tries name, then CAS number)
 2. If not, resolves a SMILES string via multiple sources:
@@ -11,10 +11,10 @@ For compounds not in the thermosteam/chemicals database, this module:
 4. Gets boiling point from the chemicals library or Joback estimation
 5. Screens the thermosteam-compatible pool for the best proxy match
 6. Returns a ready-to-use thermosteam Chemical with the proxy's thermo data
- 
+
 Compounds can be specified as plain strings or as dicts with optional
 CAS and ChEBI identifiers:
- 
+
     compounds = [
         'Water',                                          # simple name
         {'name': 'Syringaldehyde', 'cas': '134-96-3'},    # name + CAS
@@ -22,15 +22,15 @@ CAS and ChEBI identifiers:
          'chebi': 'CHEBI:80159',
          'smiles': 'OC1C(OC2=CC3=...'},
     ]
- 
+
 All HSP, density, and MW estimation is handled by Polymersolubility.py.
 This module adds only the thermosteam screening and matching logic.
- 
+
 Requirements:
     pip install thermosteam rdkit
     Polymersolubility.py must be importable (same directory or on sys.path)
 """
- 
+
 import warnings
 import math
 import json
@@ -41,10 +41,10 @@ import urllib.parse
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Union
- 
+
 import thermosteam as tmo
 from chemicals.identifiers import pubchem_db
- 
+
 # ─────────────────────────────────────────────────────────────────────
 # Import from YOUR Polymersolubility module.
 #
@@ -79,23 +79,23 @@ from Polymersolubility import (
     GROUP_CONTRIBUTIONS,
     _match_smarts_groups,
 )
- 
+
 if RDKIT_AVAILABLE:
     from rdkit import Chem
     from rdkit.Chem import Descriptors
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # COMPOUND INPUT SPECIFICATION
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 @dataclass
 class CompoundInput:
     """
     Normalised compound specification.
- 
+
     Accepts plain strings or dicts with optional identifiers::
- 
+
         'Water'                                           # just a name
         {'name': 'Syringaldehyde', 'cas': '134-96-3'}    # name + CAS
         {'name': 'Cyanidin', 'chebi': 'CHEBI:80159'}     # name + ChEBI
@@ -105,8 +105,8 @@ class CompoundInput:
     cas: Optional[str] = None
     chebi: Optional[str] = None
     smiles: Optional[str] = None
- 
- 
+
+
 def _normalise_compound(entry) -> CompoundInput:
     """Convert a string or dict into a CompoundInput."""
     if isinstance(entry, str):
@@ -121,16 +121,16 @@ def _normalise_compound(entry) -> CompoundInput:
     if isinstance(entry, CompoundInput):
         return entry
     raise TypeError(f"Expected str, dict, or CompoundInput, got {type(entry)}")
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # SMILES LOOKUP VIA CAS / ChEBI  (PubChem REST API)
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 def _lookup_smiles_by_cas(cas: str) -> Optional[str]:
     """
     Look up SMILES from PubChem using a CAS registry number.
- 
+
     PubChem endpoint: /compound/name/{CAS}/property/CanonicalSMILES/JSON
     (PubChem resolves CAS numbers as synonyms.)
     """
@@ -149,12 +149,12 @@ def _lookup_smiles_by_cas(cas: str) -> Optional[str]:
     except Exception:
         pass
     return None
- 
- 
+
+
 def _lookup_smiles_by_chebi(chebi: str) -> Optional[str]:
     """
     Look up SMILES from PubChem using a ChEBI identifier.
- 
+
     Accepts 'CHEBI:12345' or just '12345'.  Tries PubChem name search
     with the full 'CHEBI:...' string.
     """
@@ -177,12 +177,12 @@ def _lookup_smiles_by_chebi(chebi: str) -> Optional[str]:
     except Exception:
         pass
     return None
- 
- 
+
+
 def _resolve_chebi_to_identifiers(chebi: str) -> Dict[str, Optional[str]]:
     """
     Resolve a ChEBI ID to a compound name, CAS, and SMILES via PubChem.
- 
+
     Returns dict with keys: 'name', 'cas', 'smiles' (any may be None).
     Useful for feeding resolved names/CAS into thermosteam.
     """
@@ -192,7 +192,7 @@ def _resolve_chebi_to_identifiers(chebi: str) -> Dict[str, Optional[str]]:
     chebi = chebi.strip()
     if not chebi.upper().startswith('CHEBI:'):
         chebi = f"CHEBI:{chebi}"
- 
+
     # Step 1: Get PubChem CID and SMILES from ChEBI
     cid = None
     try:
@@ -209,7 +209,7 @@ def _resolve_chebi_to_identifiers(chebi: str) -> Dict[str, Optional[str]]:
                 result['name'] = props[0].get('IUPACName')
     except Exception:
         pass
- 
+
     # Step 2: Get synonyms (first synonym is usually the common name,
     #         CAS numbers appear as synonyms matching \d+-\d+-\d+ pattern)
     if cid:
@@ -233,22 +233,22 @@ def _resolve_chebi_to_identifiers(chebi: str) -> Dict[str, Optional[str]]:
                             break
         except Exception:
             pass
- 
+
     return result
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # MW FROM SMILES  (just an RDKit one-liner, no custom logic)
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 def get_mw_from_smiles(smiles: str) -> Optional[float]:
     """Molecular weight straight from RDKit."""
     if not RDKIT_AVAILABLE:
         return None
     mol = Chem.MolFromSmiles(smiles)
     return Descriptors.MolWt(mol) if mol else None
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Tm, Hfus, Vm ESTIMATION  (Van Krevelen 2009, Tables 4.10 / 5.7 / 6.8)
 # ═══════════════════════════════════════════════════════════════════════
@@ -261,13 +261,13 @@ def get_mw_from_smiles(smiles: str) -> Optional[float]:
 #   Vm   = ΣV_i                  [cm³/mol]   (Table 4.10)
 #
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 def estimate_tm_from_smiles(smiles: str) -> Optional[float]:
     """
     Van Krevelen (2009) group-contribution melting point estimate.
- 
+
     Tm = ΣYm_i / MW   [K]
- 
+
     Reference: Properties of Polymers, 4th Ed., Chapter 6, Table 6.8
     """
     groups = _match_smarts_groups(smiles)
@@ -276,63 +276,63 @@ def estimate_tm_from_smiles(smiles: str) -> Optional[float]:
     mw = get_mw_from_smiles(smiles)
     if not mw or mw <= 0:
         return None
- 
+
     sum_Ym = 0.0
     for name, count in groups.items():
         if name in GROUP_CONTRIBUTIONS:
             sum_Ym += GROUP_CONTRIBUTIONS[name]['Ym'] * count
- 
+
     if sum_Ym <= 0:
         return None
     return round(sum_Ym / mw, 1)
- 
- 
+
+
 def estimate_hfus_from_smiles(smiles: str) -> Optional[float]:
     """
     Van Krevelen (2009) group-contribution heat of fusion estimate.
- 
+
     Hfus = ΣHm_i   [kJ/mol]
- 
+
     Reference: Properties of Polymers, 4th Ed., Chapter 5, Table 5.7
     """
     groups = _match_smarts_groups(smiles)
     if not groups:
         return None
- 
+
     sum_Hm = 0.0
     for name, count in groups.items():
         if name in GROUP_CONTRIBUTIONS:
             sum_Hm += GROUP_CONTRIBUTIONS[name]['Hm'] * count
- 
+
     return round(sum_Hm, 2) if sum_Hm != 0 else None
- 
- 
+
+
 def estimate_vm_from_smiles(smiles: str) -> Optional[float]:
     """
     Van Krevelen (2009) group-contribution molar volume estimate.
- 
+
     Vm = ΣV_i   [cm³/mol]
- 
+
     Reference: Properties of Polymers, 4th Ed., Chapter 4, Table 4.10
     """
     groups = _match_smarts_groups(smiles)
     if not groups:
         return None
- 
+
     sum_V = 0.0
     for name, count in groups.items():
         if name in GROUP_CONTRIBUTIONS:
             sum_V += GROUP_CONTRIBUTIONS[name]['V'] * count
- 
+
     # Fallback if volume too small (poor group matching)
     if sum_V < 20:
         mw = get_mw_from_smiles(smiles)
         if mw:
             sum_V = mw * 0.95
- 
+
     return round(sum_V, 1) if sum_V > 0 else None
- 
- 
+
+
 def _is_organic(smiles: str) -> bool:
     """True if the molecule contains at least one carbon atom."""
     if not RDKIT_AVAILABLE:
@@ -341,12 +341,12 @@ def _is_organic(smiles: str) -> bool:
     if mol is None:
         return False
     return any(atom.GetAtomicNum() == 6 for atom in mol.GetAtoms())
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # PROXY CANDIDATE POOL  (thermosteam-compatible chemicals)
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 @dataclass
 class ProxyCandidate:
     """A thermosteam-loadable chemical with its matching properties."""
@@ -359,17 +359,17 @@ class ProxyCandidate:
     Hfus: Optional[float] = None  # kJ/mol  (Van Krevelen estimate)
     Vm: Optional[float] = None    # cm³/mol (Van Krevelen estimate)
     hsp: Optional[HSP] = None
- 
- 
+
+
 POOL_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '_proxy_pool_cache.json'
 )
- 
+
 ASSIGN_CACHE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '_assign_cache'
 )
- 
- 
+
+
 def build_proxy_pool(
     max_candidates: int = 5000,
     verbose: bool = True,
@@ -377,15 +377,15 @@ def build_proxy_pool(
     """
     Screen the chemicals/pubchem database for thermosteam-compatible
     organic compounds and estimate their HSP via Polymersolubility.
- 
+
     Each candidate must:
       - have a SMILES string
       - be organic (contains carbon)
       - load in thermosteam with a valid boiling point
- 
+
     HSP is estimated using estimate_hsp_from_smiles() from
     Polymersolubility.py (Hoftyzer-Van Krevelen method).
- 
+
     Results are cached to '_proxy_pool_cache.json' so subsequent
     calls load instantly.
     """
@@ -394,19 +394,19 @@ def build_proxy_pool(
         try:
             with open(POOL_CACHE_FILE) as f:
                 data = json.load(f)
- 
+
             # ① Reject old list-format caches (pre-v2) immediately
             if isinstance(data, list):
                 if verbose:
                     print("[proxy-pool] Cache outdated (pre-v2 list format), rebuilding …")
                 raise ValueError("old cache format — needs v2 dict wrapper")
- 
+
             # ② Check version tag
             if data.get('version') != 3:
                 if verbose:
                     print("[proxy-pool] Cache version mismatch (need v3 with gas-phase validation), rebuilding …")
                 raise ValueError("cache version mismatch")
- 
+
             # ③ Load the pool list
             pool_data = data['pool']
             pool = []
@@ -419,25 +419,25 @@ def build_proxy_pool(
             return pool
         except Exception:
             pass  # rebuild
- 
+
     # ── Build from scratch ──────────────────────────────────────────
     if verbose:
         print("[proxy-pool] Building proxy pool from chemicals database …")
         print("             (this takes ~30s on first run, cached after)")
- 
+
     pool: List[ProxyCandidate] = []
     entries = list(pubchem_db.CAS_index.items())
- 
+
     for i, (cas_int, entry) in enumerate(entries[:max_candidates]):
         name = entry.common_name
         smiles = entry.smiles
         if not smiles or not name:
             continue
- 
+
         # Only organic compounds make sensible proxies
         if not _is_organic(smiles):
             continue
- 
+
         # Must load in thermosteam with a finite boiling point and valid Hf
         try:
             with warnings.catch_warnings():
@@ -465,7 +465,7 @@ def build_proxy_pool(
                         continue
             except Exception:
                 continue
- 
+
         # Proxy candidates must have working gas-phase enthalpy so they
         # don't crash Gas_Enthalpy_Ref_Solid in the evaporator
         if not getattr(chem, 'locked_state', None) and tb is not None:
@@ -481,28 +481,28 @@ def build_proxy_pool(
                     break
             if not _pool_gas_ok:
                 continue
- 
+
         # Estimate properties using Polymersolubility's functions
         hsp = estimate_hsp_from_smiles(smiles)
         tm = estimate_tm_from_smiles(smiles)
         hfus = estimate_hfus_from_smiles(smiles)
         vm = estimate_vm_from_smiles(smiles)
- 
+
         pool.append(ProxyCandidate(
             name=name, cas=entry.CASs, smiles=smiles,
             MW=round(mw, 2), Tb=round(tb, 2),
             Tm=tm, Hfus=hfus, Vm=vm, hsp=hsp,
         ))
- 
+
         if verbose and (i + 1) % 500 == 0:
             print(f"  … screened {i+1}/{min(max_candidates, len(entries))}"
                   f"  ({len(pool)} valid so far)")
- 
+
     if verbose:
         hsp_count = sum(1 for c in pool if c.hsp is not None)
         print(f"[proxy-pool] Done: {len(pool)} candidates"
               f" ({hsp_count} with HSP)")
- 
+
     # ── Cache to disk ───────────────────────────────────────────────
     try:
         pool_data = []
@@ -525,14 +525,14 @@ def build_proxy_pool(
             print(f"[proxy-pool] Cache saved (v3, gas-phase validated) → {POOL_CACHE_FILE}")
     except Exception:
         pass
- 
+
     return pool
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # PROXY MATCHING
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 @dataclass
 class ProxyMatch:
     """Result of a proxy search for one target compound."""
@@ -555,7 +555,7 @@ class ProxyMatch:
     proxy_hsp: Optional[HSP] = None
     distance: Optional[float] = None
     top_candidates: List[dict] = field(default_factory=list)
- 
+
     def summary(self) -> str:
         if self.in_thermosteam:
             return (f"  ✓  {self.target_name:30s}"
@@ -588,8 +588,8 @@ class ProxyMatch:
                 f" {self.proxy_hsp.dH:.1f})"
             )
         return '\n'.join(lines)
- 
- 
+
+
 def _normalised_distance(
     target_MW: float, target_Tm: float,
     target_Hfus: float, target_Vm: float,
@@ -608,7 +608,7 @@ def _normalised_distance(
     """
     Weighted normalised Euclidean distance in
     (MW, Tm, Hfus, Vm, dD, dP, dH) space.
- 
+
     MW, Tm, Hfus, Vm use fractional differences.
     HSP components use absolute differences scaled by 15 MPa^0.5.
     """
@@ -617,7 +617,7 @@ def _normalised_distance(
     d_Tm   = ((cand_Tm   - target_Tm)   / max(target_Tm,   1.0)) ** 2
     d_Hfus = ((cand_Hfus - target_Hfus) / max(abs(target_Hfus), 0.1)) ** 2
     d_Vm   = ((cand_Vm   - target_Vm)   / max(target_Vm,   1.0)) ** 2
- 
+
     # HSP: absolute difference / typical magnitude
     if target_hsp and cand_hsp:
         scale = 15.0
@@ -632,14 +632,14 @@ def _normalised_distance(
         d_dD = d_dP = d_dH = 0.0
         w_MW *= 1.5
         w_Tm *= 1.5
- 
+
     return np.sqrt(
         w_MW * d_MW + w_Tm * d_Tm +
         w_Hfus * d_Hfus + w_Vm * d_Vm +
         w_dD * d_dD + w_dP * d_dP + w_dH * d_dH
     )
- 
- 
+
+
 def find_proxy(
     compound: Union[str, dict, CompoundInput],
     target_smiles: Optional[str] = None,
@@ -650,17 +650,17 @@ def find_proxy(
 ) -> ProxyMatch:
     """
     Find the best thermosteam-compatible proxy for a target compound.
- 
+
     Parameters
     ----------
     compound : str, dict, or CompoundInput
         Chemical identifier.  Can be a plain name string, or a dict /
         CompoundInput with optional 'cas', 'chebi', and 'smiles' fields::
- 
+
             'Ethanol'
             {'name': 'Syringaldehyde', 'cas': '134-96-3'}
             {'name': 'Cyanidin', 'chebi': 'CHEBI:80159', 'smiles': '...'}
- 
+
     target_smiles : str, optional
         Explicit SMILES override (kept for backward compatibility;
         prefer putting smiles in the compound dict).
@@ -671,7 +671,7 @@ def find_proxy(
     weights : dict, optional
         Override distance weights.  Keys: 'MW', 'Tb', 'dD', 'dP', 'dH'.
         Default is 1.0 for each.
- 
+
     Returns
     -------
     ProxyMatch with the best proxy and diagnostics.
@@ -679,13 +679,13 @@ def find_proxy(
     # Normalise input
     ci = _normalise_compound(compound)
     target_name = ci.name
- 
+
     # Merge SMILES from dict and legacy argument (dict takes priority)
     if ci.smiles:
         target_smiles = ci.smiles
     cas = ci.cas
     chebi = ci.chebi
- 
+
     # ── 0. Resolve ChEBI → name / CAS / SMILES via PubChem ─────────
     #    (enriches identifiers before the main lookup chain)
     chebi_resolved = {}
@@ -696,12 +696,12 @@ def find_proxy(
             cas = chebi_resolved['cas']
         if not target_smiles and chebi_resolved.get('smiles'):
             target_smiles = chebi_resolved['smiles']
- 
+
     w = {'MW': 1.0, 'Tm': 1.0, 'Hfus': 1.0, 'Vm': 1.0,
          'dD': 1.0, 'dP': 1.0, 'dH': 1.0}
     if weights:
         w.update(weights)
- 
+
     # ── 1. Check if thermosteam already has it ──────────────────────
     #    Try: name → CAS → name resolved from ChEBI
     identifiers_to_try = [target_name, cas]
@@ -709,7 +709,7 @@ def find_proxy(
         identifiers_to_try.append(chebi_resolved['name'])
     if chebi_resolved.get('cas') and chebi_resolved['cas'] != cas:
         identifiers_to_try.append(chebi_resolved['cas'])
- 
+
     for identifier in identifiers_to_try:
         if identifier is None:
             continue
@@ -720,7 +720,7 @@ def find_proxy(
                 # Reject if Hf is missing — 0*NaN poisons Hnet in HXutility
                 if chem.Hf is None or (isinstance(chem.Hf, float) and math.isnan(chem.Hf)):
                     continue
- 
+
                 # ── Gas-phase enthalpy check ───────────────────────
                 # Only needed if the compound has meaningful vapor
                 # pressure.  Compounds with Psat < 1e-5 Pa at 100°C
@@ -734,7 +734,7 @@ def find_proxy(
                         _psat = 0.0
                     if _psat < 1e-5:
                         _needs_gas_check = False  # will be phase-locked
- 
+
                 if _needs_gas_check and not getattr(chem, 'locked_state', None) and chem.Tb is not None:
                     _gas_ok = True
                     for _T in [chem.Tb + 10, chem.Tb + 50, chem.Tb + 100]:
@@ -751,7 +751,7 @@ def find_proxy(
                             print(f"  ⚠  '{target_name}' loaded in thermosteam but "
                                   f"H('g') fails near Tb → searching for proxy")
                         continue  # fall through to proxy search
- 
+
                 return ProxyMatch(
                     target_name=target_name,
                     target_smiles=target_smiles,
@@ -764,7 +764,7 @@ def find_proxy(
                 )
         except Exception:
             continue
- 
+
     # ── 2. Get target SMILES ────────────────────────────────────────
     #
     # Full lookup chain, tried in order until one succeeds:
@@ -787,12 +787,12 @@ def find_proxy(
         smiles_source = 'ChEBI_resolved'
     else:
         smiles_source = None
- 
+
     # (b) Name is itself a SMILES?
     if smiles is None and is_valid_smiles(target_name):
         smiles = target_name
         smiles_source = 'direct_SMILES'
- 
+
     # (c) chemicals library by name
     if smiles is None:
         try:
@@ -801,9 +801,12 @@ def find_proxy(
             if info and info.smiles:
                 smiles = info.smiles
                 smiles_source = 'chemicals_library'
-        except Exception:
-            pass
- 
+            elif verbose:
+                print(f"  [DEBUG] (c) chemicals_library: no SMILES for '{target_name}' (info={info})")
+        except Exception as e:
+            if verbose:
+                print(f"  [DEBUG] (c) chemicals_library('{target_name}') failed: {type(e).__name__}: {e}")
+
     # (d) chemicals library by CAS
     if smiles is None and cas:
         try:
@@ -812,9 +815,12 @@ def find_proxy(
             if info and info.smiles:
                 smiles = info.smiles
                 smiles_source = 'chemicals_library_CAS'
-        except Exception:
-            pass
- 
+            elif verbose:
+                print(f"  [DEBUG] (d) chemicals_library_CAS: no SMILES for cas='{cas}' (info={info})")
+        except Exception as e:
+            if verbose:
+                print(f"  [DEBUG] (d) chemicals_library_CAS('{cas}') failed: {type(e).__name__}: {e}")
+
     # (e) Polymersolubility lookup chain by name
     #     (PubChem REST, ChEBI OLS, NIH CIR)
     if smiles is None:
@@ -826,7 +832,7 @@ def find_proxy(
         except Exception as e:
             if verbose:
                 print(f"  [DEBUG] (e) lookup_smiles('{target_name}') failed: {type(e).__name__}: {e}")
- 
+
     # (f) PubChem REST API by CAS
     if smiles is None and cas:
         try:
@@ -837,7 +843,7 @@ def find_proxy(
         except Exception as e:
             if verbose:
                 print(f"  [DEBUG] (f) _lookup_smiles_by_cas('{cas}') failed: {type(e).__name__}: {e}")
- 
+
     # (g) PubChem REST API by ChEBI
     if smiles is None and chebi:
         try:
@@ -848,7 +854,7 @@ def find_proxy(
         except Exception as e:
             if verbose:
                 print(f"  [DEBUG] (g) _lookup_smiles_by_chebi('{chebi}') failed: {type(e).__name__}: {e}")
- 
+
     # (h) Polymersolubility lookup chain with CAS as search term
     if smiles is None and cas:
         try:
@@ -859,15 +865,17 @@ def find_proxy(
         except Exception as e:
             if verbose:
                 print(f"  [DEBUG] (h) lookup_smiles('{cas}') failed: {type(e).__name__}: {e}")
- 
+
     if smiles is None:
+        if verbose:
+            print(f"  [DEBUG] All SMILES lookups exhausted for '{target_name}' — no proxy possible")
         return ProxyMatch(
             target_name=target_name, target_smiles=None,
             target_MW=None, target_Tm=None, target_Hfus=None,
             target_Vm=None, target_hsp=None,
             in_thermosteam=False, smiles_source=None,
         )
- 
+
     # ── 3. Estimate target properties ───────────────────────────────
     #
     #   All from Polymersolubility.py / GROUP_CONTRIBUTIONS:
@@ -882,7 +890,7 @@ def find_proxy(
     target_Tm   = estimate_tm_from_smiles(smiles)
     target_Hfus = estimate_hfus_from_smiles(smiles)
     target_Vm   = estimate_vm_from_smiles(smiles)
- 
+
     if target_MW is None:
         return ProxyMatch(
             target_name=target_name, target_smiles=smiles,
@@ -890,11 +898,11 @@ def find_proxy(
             target_Vm=None, target_hsp=target_hsp,
             in_thermosteam=False, smiles_source=smiles_source,
         )
- 
+
     # ── 4. Screen the pool ──────────────────────────────────────────
     if pool is None:
         pool = build_proxy_pool(verbose=True)
- 
+
     scored = []
     for cand in pool:
         dist = _normalised_distance(
@@ -909,10 +917,10 @@ def find_proxy(
             w_dD=w['dD'], w_dP=w['dP'], w_dH=w['dH'],
         )
         scored.append((dist, cand))
- 
+
     scored.sort(key=lambda x: x[0])
     top = scored[:n_top]
- 
+
     if not top:
         return ProxyMatch(
             target_name=target_name, target_smiles=smiles,
@@ -921,9 +929,9 @@ def find_proxy(
             target_hsp=target_hsp, in_thermosteam=False,
             smiles_source=smiles_source,
         )
- 
+
     best_dist, best = top[0]
- 
+
     return ProxyMatch(
         target_name=target_name, target_smiles=smiles,
         target_MW=target_MW, target_Tm=target_Tm,
@@ -946,24 +954,24 @@ def find_proxy(
             for d, c in top
         ],
     )
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # SERIALISATION HELPERS  (for assign_proxies result caching)
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 def _hsp_to_dict(hsp: Optional[HSP]) -> Optional[dict]:
     if hsp is None:
         return None
     return {'dD': hsp.dD, 'dP': hsp.dP, 'dH': hsp.dH, 'source': hsp.source}
- 
- 
+
+
 def _dict_to_hsp(d: Optional[dict]) -> Optional[HSP]:
     if d is None:
         return None
     return HSP(**d)
- 
- 
+
+
 def _proxy_match_to_dict(m: ProxyMatch) -> dict:
     return {
         'target_name': m.target_name,
@@ -986,15 +994,15 @@ def _proxy_match_to_dict(m: ProxyMatch) -> dict:
         'distance': m.distance,
         'top_candidates': m.top_candidates,
     }
- 
- 
+
+
 def _dict_to_proxy_match(d: dict) -> ProxyMatch:
     d = dict(d)  # shallow copy
     d['target_hsp'] = _dict_to_hsp(d.get('target_hsp'))
     d['proxy_hsp'] = _dict_to_hsp(d.get('proxy_hsp'))
     return ProxyMatch(**d)
- 
- 
+
+
 def _make_assign_cache_key(
     compounds: list,
     smiles_map: Optional[dict],
@@ -1003,7 +1011,7 @@ def _make_assign_cache_key(
 ) -> str:
     """
     Deterministic hash of the inputs to assign_proxies.
- 
+
     Any change in compound list, order, identifiers, skip list,
     weights, or smiles overrides produces a different key.
     """
@@ -1023,14 +1031,14 @@ def _make_assign_cache_key(
         default=str,
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
- 
- 
+
+
 def _load_assign_cache(
     cache_key: str, verbose: bool = True,
 ) -> Optional[Tuple[Dict[str, ProxyMatch], Dict[str, str]]]:
     """
     Try to load a cached assign_proxies result.
- 
+
     Returns (report, name_map) on hit, or None on miss.
     The *chemicals* list is NOT cached because thermosteam Chemical
     objects are not serialisable — it is rebuilt cheaply from the
@@ -1055,8 +1063,8 @@ def _load_assign_cache(
         return report, name_map
     except Exception:
         return None
- 
- 
+
+
 def _save_assign_cache(
     cache_key: str,
     report: Dict[str, ProxyMatch],
@@ -1082,30 +1090,30 @@ def _save_assign_cache(
     except Exception as e:
         if verbose:
             print(f"[assign-cache] Could not save cache: {e}")
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # BATCH PROCESSING + THERMOSTEAM INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 def _backfill_solid_volume(chem, vm_cm3: Optional[float] = None,
                            verbose: bool = False) -> None:
     """
     Ensure *chem* has a solid molar volume method (V.s).
- 
+
     Many thermosteam chemicals — especially proxies — only carry liquid-
     phase property correlations.  When a BioSTEAM unit (e.g. StorageTank)
     tries to compute the volumetric flow of a solid-phase stream it calls
     ``chem.V.s(T)``, which raises if no method is registered.
- 
+
     This function tests for that and, when the method is missing, adds a
     constant-value fallback:
- 
+
     1. Use the Van Krevelen group-contribution Vm already estimated by the
        proxy finder (passed as *vm_cm3*, in cm³ mol⁻¹).
     2. If that is unavailable, estimate from MW assuming a typical organic-
        solid density of 1 200 kg m⁻³.
- 
+
     Parameters
     ----------
     chem : thermosteam.Chemical
@@ -1121,7 +1129,7 @@ def _backfill_solid_volume(chem, vm_cm3: Optional[float] = None,
         return                       # nothing to do
     except Exception:
         pass
- 
+
     # Build the best constant estimate we can
     if vm_cm3 and vm_cm3 > 0:
         Vm_m3 = vm_cm3 * 1e-6       # cm³ mol⁻¹  →  m³ mol⁻¹
@@ -1130,7 +1138,7 @@ def _backfill_solid_volume(chem, vm_cm3: Optional[float] = None,
         # Fallback: assume solid density ≈ 1 200 kg m⁻³
         Vm_m3 = chem.MW / (1200.0 * 1e3)   # m³ mol⁻¹
         source = 'MW / 1200 kg m⁻³'
- 
+
     # thermosteam expects V.s(T) → m³ mol⁻¹
     # Strategy 1: V.s is a proper TDependentProperty with add_method
     Vs = getattr(chem.V, 's', None)
@@ -1140,7 +1148,7 @@ def _backfill_solid_volume(chem, vm_cm3: Optional[float] = None,
             print(f"  ⚠  Backfilled V.s for '{chem.ID}' "
                   f"({source}, Vm = {Vm_m3:.3e} m³/mol)")
         return
- 
+
     # Strategy 2: V.s is missing or is a placeholder (e.g. a string).
     # Create a fresh VolumeSolid object and wire it into the phase handle.
     try:
@@ -1155,7 +1163,7 @@ def _backfill_solid_volume(chem, vm_cm3: Optional[float] = None,
         return
     except Exception:
         pass
- 
+
     # Strategy 3: Monkey-patch V.s as a simple callable so that
     # downstream code calling chem.V.s(T) gets a float back.
     try:
@@ -1166,12 +1174,12 @@ def _backfill_solid_volume(chem, vm_cm3: Optional[float] = None,
         return
     except Exception:
         pass
- 
+
     if verbose:
         print(f"  ⚠  Could not backfill V.s for '{chem.ID}' "
               f"— StorageTank may fail on solid-phase streams")
- 
- 
+
+
 def _rebuild_chemicals_from_report(
     report: Dict[str, ProxyMatch],
     name_map: Dict[str, str],
@@ -1179,7 +1187,7 @@ def _rebuild_chemicals_from_report(
 ) -> list:
     """
     Rebuild the chemicals list from a cached report.
- 
+
     This is the only work needed on a cache hit — fast local
     tmo.Chemical() calls, no SMILES lookups or API calls.
     """
@@ -1187,7 +1195,7 @@ def _rebuild_chemicals_from_report(
     for name, match in report.items():
         if match.smiles_source == 'skipped':
             continue
- 
+
         if match.in_thermosteam:
             ts_id = match.thermosteam_id
             if ts_id is not None:
@@ -1217,10 +1225,10 @@ def _rebuild_chemicals_from_report(
                 )
                 chemicals.append(copy)
         # else: no proxy found — skip, same as original logic
- 
+
     return chemicals
- 
- 
+
+
 def assign_proxies(
     compounds: List[Union[str, dict, CompoundInput]],
     smiles_map: Optional[Dict[str, str]] = None,
@@ -1232,11 +1240,11 @@ def assign_proxies(
     """
     For a list of compounds, check thermosteam availability and
     assign proxies for those that are missing.
- 
+
     Results are cached to disk so that repeated calls with the same
     compound list skip all SMILES lookups, API calls, and proxy
     matching.  Set *use_cache=False* to force a fresh run.
- 
+
     Parameters
     ----------
     compounds : list
@@ -1264,7 +1272,7 @@ def assign_proxies(
     use_cache : bool
         If True (default), check for a cached result before doing
         the full resolution.  Set False to force a fresh run.
- 
+
     Returns
     -------
     chemicals : list[str | thermosteam.Chemical]
@@ -1285,10 +1293,10 @@ def assign_proxies(
     if smiles_map is None:
         smiles_map = {}
     skip_set = set(s.lower().strip() for s in (skip or []))
- 
+
     # ── Try loading from cache ──────────────────────────────────────
     cache_key = _make_assign_cache_key(compounds, smiles_map, skip, weights)
- 
+
     if use_cache:
         cached = _load_assign_cache(cache_key, verbose=verbose)
         if cached is not None:
@@ -1305,23 +1313,23 @@ def assign_proxies(
                 print(f" Summary (cached): {n_native} native  |  "
                       f"{n_proxy} proxied  |  {n_fail} failed")
             return chemicals, report, name_map
- 
+
     # ── Full resolution (no cache hit) ──────────────────────────────
     # Build pool once
     pool = build_proxy_pool(verbose=verbose)
- 
+
     report: Dict[str, ProxyMatch] = {}
     chemicals: list = []                  # mix of str (native) and Chemical (proxy)
     name_map: Dict[str, str] = {}         # {thermosteam_id: original_user_name}
- 
+
     if verbose:
         print(f"\n{'='*72}")
         print(f" Processing {len(compounds)} compounds")
         print(f"{'='*72}")
- 
+
     for entry in compounds:
         ci = _normalise_compound(entry)
- 
+
         # Skip compounds already defined in the user's BioSTEAM model
         if ci.name.lower().strip() in skip_set:
             match = ProxyMatch(
@@ -1336,14 +1344,14 @@ def assign_proxies(
                 print(f"  ⊘  {ci.name:30s}"
                       f" — skipped (user-defined in BioSTEAM model)")
             continue
- 
+
         # Merge legacy smiles_map
         if ci.name in smiles_map and not ci.smiles:
             ci.smiles = smiles_map[ci.name]
- 
+
         match = find_proxy(ci, pool=pool, weights=weights, verbose=verbose)
         report[ci.name] = match
- 
+
         if match.in_thermosteam:
             # ── Native compound: pass as a STRING so tmo.Chemicals()
             #    builds it from its own database with full phase-locks
@@ -1390,10 +1398,10 @@ def assign_proxies(
         else:
             if verbose:
                 print(f"  WARNING: No proxy found for '{ci.name}' – skipped")
- 
+
         if verbose:
             print(match.summary())
- 
+
     if verbose:
         n_native = sum(1 for m in report.values() if m.in_thermosteam)
         n_proxy = sum(1 for m in report.values()
@@ -1408,18 +1416,18 @@ def assign_proxies(
             for ts_id, orig in name_map.items():
                 print(f"   {ts_id:30s} → {orig}")
         print(f"{'─'*72}\n")
- 
+
     # ── Save to cache ───────────────────────────────────────────────
     if use_cache:
         _save_assign_cache(cache_key, report, name_map, verbose=verbose)
- 
+
     return chemicals, report, name_map
- 
- 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CONVENIENCE: build a complete thermosteam Thermo object
 # ═══════════════════════════════════════════════════════════════════════
- 
+
 def create_thermo(
     compounds: List[Union[str, dict, CompoundInput]],
     smiles_map: Optional[Dict[str, str]] = None,
@@ -1429,7 +1437,7 @@ def create_thermo(
     """
     One-call setup: returns a tmo.Thermo with all compounds
     (native or proxied), plus a name mapping.
- 
+
     Usage
     -----
     >>> thermo, report, name_map = create_thermo([
