@@ -2,6 +2,10 @@ streamlit
 biosteam==2.53.9
 thermosteam==0.53.3
 flexsolve==0.5.10
+chemicals==1.5.1
+thermo==0.6.0
+rdkit
+libchebipy
 numpy
 scipy
 matplotlib
