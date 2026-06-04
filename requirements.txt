@@ -1,11 +1,10 @@
 streamlit
-biosteam
+biosteam==2.53.9
 thermosteam==0.53.3
-flexsolve
+flexsolve==0.5.10
 numpy
 scipy
 matplotlib
 pandas
 Pillow
 graphviz
- 
