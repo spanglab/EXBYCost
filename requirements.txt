@@ -1,6 +1,6 @@
 streamlit
 biosteam
-thermosteam
+thermosteam==0.53.3
 flexsolve
 numpy
 scipy
