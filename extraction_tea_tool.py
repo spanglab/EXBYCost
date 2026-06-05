@@ -3002,18 +3002,38 @@ elif sim_mode == "Parameter Sweep" and run_sweep:
                            for k in sweep_values.keys())
     st.caption(f"Varying: {swept_list}")
 
+    # ── Persistent sweep state: survives Streamlit reconnects ────────────
+    _sweep_key = f"sweep_results_{hash(str(sorted(sweep_values.items())))}"
+    if _sweep_key not in st.session_state:
+        st.session_state[_sweep_key] = {
+            'results_rows': [],
+            'error_rows': [],
+            'times_per_run': [],
+            'completed': 0,
+        }
+    _sweep_state = st.session_state[_sweep_key]
+    results_rows  = _sweep_state['results_rows']
+    error_rows    = _sweep_state['error_rows']
+    times_per_run = _sweep_state['times_per_run']
+    already_done  = _sweep_state['completed']
+
     # Progress UI: bar, status line, live results preview
     sweep_bar = st.progress(0.0)
     sweep_status = st.empty()
     sweep_extra = st.empty()
     error_box = st.empty()
 
-    results_rows = []
-    error_rows = []
-    times_per_run = []
+    if already_done > 0:
+        st.info(
+            f"Resuming sweep — {already_done} of {n_total} run(s) already "
+            f"completed before reconnection."
+        )
+
     sweep_start = time.time()
 
     for i, overrides in enumerate(combos):
+        if i < already_done:
+            continue  # skip runs already completed before reconnect
         params = {**base_params, **overrides}
 
         # If the user is sweeping ExtractP_custom we force pressure_mode
@@ -3064,6 +3084,7 @@ elif sim_mode == "Parameter Sweep" and run_sweep:
                 row = {**overrides, **scalars, 'tea_forced_foak': _forced_foak,
                        'run_time_s': run_dt, 'error': ''}
                 results_rows.append(row)
+                _sweep_state['completed'] = i + 1
         except Exception as exc:
             run_dt = time.time() - run_start
             times_per_run.append(run_dt)
@@ -3071,6 +3092,7 @@ elif sim_mode == "Parameter Sweep" and run_sweep:
             error_rows.append({**overrides, 'error': err_msg})
             results_rows.append({**overrides, 'tea_forced_foak': _forced_foak,
                                  'run_time_s': run_dt, 'error': err_msg})
+            _sweep_state['completed'] = i + 1
             # Surface errors as they happen, but don't stop the sweep
             with error_box.container():
                 st.warning(
