@@ -29,6 +29,10 @@ import io
 import time
 import itertools
 import contextlib
+import threading
+import json
+import tempfile
+import hashlib
 import warnings
 warnings.filterwarnings("ignore", message=".*has no defined Dortmund groups.*")
 warnings.filterwarnings("ignore", message=".*overflow encountered in exp.*")
@@ -2989,181 +2993,351 @@ def _collect_base_params():
     }
 
 
-if sim_mode == "Single Run" and run_simulation:
-    _run_one_simulation(_collect_base_params(), display=True)
+# ============================================================================
+# Background parameter-sweep engine
+# ----------------------------------------------------------------------------
+# The sweep runs in a daemon thread that is fully decoupled from Streamlit's
+# script-rerun cycle. It calls _run_one_simulation(..., display=False), which
+# touches no Streamlit APIs, so widget interactions (fiddling the sidebar),
+# websocket reconnects and tab refreshes no longer interrupt it. Each completed
+# run is recorded both in a shared in-memory state object (for the live UI) and
+# appended to a JSONL file on disk (so a reconnect can resume / re-download).
+# The sweep only stops when every run is done OR the user presses Stop.
+# ============================================================================
 
-elif sim_mode == "Parameter Sweep" and run_sweep:
-    base_params = _collect_base_params()
-    combos = _build_combinations(sweep_values)
-    n_total = len(combos)
+_SWEEP_DIR = os.path.join(tempfile.gettempdir(), "extraction_sweeps")
+try:
+    os.makedirs(_SWEEP_DIR, exist_ok=True)
+except Exception:
+    _SWEEP_DIR = tempfile.gettempdir()
 
-    st.subheader(f"🔄 Parameter Sweep — {n_total} run(s)")
-    swept_list = ", ".join(f"`{sweep_summary_labels.get(k, k)}`"
-                           for k in sweep_values.keys())
-    st.caption(f"Varying: {swept_list}")
+# BioSTEAM uses a global flowsheet / settings, so two simulations must never
+# run at the same time (background sweep worker + a Single Run, or two browser
+# sessions sharing one Community Cloud process). This lock serialises them.
+_SIM_LOCK = threading.Lock()
 
-    # ── Persistent sweep state: survives Streamlit reconnects ────────────
-    _sweep_key = f"sweep_results_{hash(str(sorted(sweep_values.items())))}"
-    if _sweep_key not in st.session_state:
-        st.session_state[_sweep_key] = {
-            'results_rows': [],
-            'error_rows': [],
-            'times_per_run': [],
-            'completed': 0,
-        }
-    _sweep_state = st.session_state[_sweep_key]
-    results_rows  = _sweep_state['results_rows']
-    error_rows    = _sweep_state['error_rows']
-    times_per_run = _sweep_state['times_per_run']
-    already_done  = _sweep_state['completed']
 
-    # Progress UI: bar, status line, live results preview
-    sweep_bar = st.progress(0.0)
-    sweep_status = st.empty()
-    sweep_extra = st.empty()
-    error_box = st.empty()
+def _sweep_results_path(sweep_key):
+    return os.path.join(_SWEEP_DIR, f"{sweep_key}.jsonl")
 
-    if already_done > 0:
-        st.info(
-            f"Resuming sweep — {already_done} of {n_total} run(s) already "
-            f"completed before reconnection."
-        )
 
-    sweep_start = time.time()
-
+def _sweep_worker(state, base_params, combos, tea_mode_snapshot, results_path):
+    """Execute the whole sweep in a background thread (no Streamlit calls)."""
     for i, overrides in enumerate(combos):
-        if i < already_done:
-            continue  # skip runs already completed before reconnect
-        params = {**base_params, **overrides}
+        # Honour an explicit Stop request (checked before each run).
+        if state['stop'].is_set():
+            break
+        # Skip runs already completed before a reconnect/resume.
+        if i < state['completed']:
+            continue
 
-        # If the user is sweeping ExtractP_custom we force pressure_mode
-        # to "Custom" for that run, otherwise the value would be ignored.
+        params = {**base_params, **overrides}
         if 'ExtractP_custom' in overrides:
             params['pressure_mode'] = 'Custom'
 
-        # Ultrasound is a first-of-a-kind (FOAK) process and must not run on
-        # mature "Nth Plant" economics. If the sidebar TEA mode is "Nth Plant"
-        # and this run's reactor is ultrasound (e.g. because reactor_type is
-        # being swept), swap in the FOAK economic defaults for this run. Any
-        # TEA parameter the user is explicitly sweeping still takes precedence.
         _forced_foak = False
-        if (tea_mode == "Nth Plant"
+        if (tea_mode_snapshot == "Nth Plant"
                 and params.get('reactor_type') == 'ultrasound'):
             params.update({k: v for k, v in TEA_DEFAULTS_FOAK.items()
                            if k in params})
-            params.update(overrides)  # explicit swept values win over FOAK
+            params.update(overrides)  # explicit swept values still win
             _forced_foak = True
-
-        # Status with ETA (after first run completes we have a baseline)
-        elapsed = time.time() - sweep_start
-        if times_per_run:
-            avg = sum(times_per_run) / len(times_per_run)
-            eta = avg * (n_total - i)
-            eta_text = (f"avg/run **{_fmt_duration(avg)}** · "
-                        f"ETA **{_fmt_duration(eta)}**")
-        else:
-            eta_text = "ETA: estimating after first run..."
-        overrides_text = " · ".join(
-            f"{sweep_summary_labels.get(k, k)}="
-            f"{(v if not isinstance(v, float) else f'{v:.4g}')}"
-            for k, v in overrides.items()
-        )
-        sweep_status.info(
-            f"**Run {i + 1} of {n_total}**  ·  elapsed "
-            f"**{_fmt_duration(elapsed)}**  ·  {eta_text}"
-        )
-        sweep_extra.caption(f"Current overrides: {overrides_text}")
-        sweep_bar.progress(i / n_total)
 
         run_start = time.time()
         try:
-            scalars = _run_one_simulation(params, display=False)
+            with _SIM_LOCK:
+                scalars = _run_one_simulation(params, display=False)
             run_dt = time.time() - run_start
-            times_per_run.append(run_dt)
             if scalars is not None:
                 row = {**overrides, **scalars, 'tea_forced_foak': _forced_foak,
                        'run_time_s': run_dt, 'error': ''}
-                results_rows.append(row)
-                _sweep_state['completed'] = i + 1
+            else:
+                row = {**overrides, 'tea_forced_foak': _forced_foak,
+                       'run_time_s': run_dt, 'error': 'no result returned'}
+            err_row = None
         except Exception as exc:
             run_dt = time.time() - run_start
-            times_per_run.append(run_dt)
             err_msg = f"{type(exc).__name__}: {exc}"
-            error_rows.append({**overrides, 'error': err_msg})
-            results_rows.append({**overrides, 'tea_forced_foak': _forced_foak,
-                                 'run_time_s': run_dt, 'error': err_msg})
-            _sweep_state['completed'] = i + 1
-            # Surface errors as they happen, but don't stop the sweep
-            with error_box.container():
-                st.warning(
-                    f"Run {i + 1} failed ({err_msg}) — continuing."
-                )
+            row = {**overrides, 'tea_forced_foak': _forced_foak,
+                   'run_time_s': run_dt, 'error': err_msg}
+            err_row = {**overrides, 'error': err_msg}
 
-    total_elapsed = time.time() - sweep_start
-    sweep_bar.progress(1.0)
-    sweep_status.success(
-        f"✅ Sweep complete — {n_total} run(s) in "
-        f"**{_fmt_duration(total_elapsed)}** "
-        f"({len(results_rows) - len(error_rows)} ok, "
-        f"{len(error_rows)} failed)"
+        with state['lock']:
+            state['results_rows'].append(row)
+            if err_row is not None:
+                state['error_rows'].append(err_row)
+            state['times_per_run'].append(run_dt)
+            state['completed'] = i + 1
+            state['current_overrides'] = dict(overrides)
+            state['last_update'] = time.time()
+
+        # Durable, crash-safe append (survives a browser reconnect).
+        try:
+            with open(results_path, 'a') as fh:
+                fh.write(json.dumps(row, default=str) + "\n")
+        except Exception:
+            pass
+
+    with state['lock']:
+        state['running'] = False
+        state['finished_at'] = time.time()
+
+
+def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
+                 labels, fresh=False):
+    """Build shared state, optionally resume from disk, and launch the thread.
+
+    Returns the session_state key under which the sweep state is stored.
+    """
+    sweep_key = "sweep_" + hashlib.md5(
+        str(sorted(sweep_values.items())).encode("utf-8")).hexdigest()[:16]
+    results_path = _sweep_results_path(sweep_key)
+    state_key = f"sweepstate_{sweep_key}"
+
+    # If a sweep for this key is already running, stop it before relaunching.
+    old = st.session_state.get(state_key)
+    if old is not None and old.get('running') and old.get('stop') is not None:
+        old['stop'].set()
+
+    if fresh:
+        try:
+            if os.path.exists(results_path):
+                os.remove(results_path)
+        except Exception:
+            pass
+
+    # Resume: load any rows already on disk for this exact config.
+    prior_rows, prior_errs, prior_times = [], [], []
+    if os.path.exists(results_path):
+        try:
+            with open(results_path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    r = json.loads(line)
+                    prior_rows.append(r)
+                    prior_times.append(float(r.get('run_time_s', 0.0) or 0.0))
+                    if r.get('error'):
+                        prior_errs.append(
+                            {k: v for k, v in r.items()
+                             if k not in ('tea_forced_foak', 'run_time_s')})
+        except Exception:
+            prior_rows, prior_errs, prior_times = [], [], []
+
+    state = {
+        'lock': threading.Lock(),
+        'stop': threading.Event(),
+        'results_rows': prior_rows,
+        'error_rows': prior_errs,
+        'times_per_run': prior_times,
+        'completed': len(prior_rows),
+        'current_overrides': {},
+        'running': True,
+        'started_at': time.time(),
+        'last_update': time.time(),
+        'finished_at': None,
+        'n_total': len(combos),
+        'sweep_values': dict(sweep_values),
+        'labels': dict(labels),
+        'results_path': results_path,
+    }
+
+    t = threading.Thread(
+        target=_sweep_worker,
+        args=(state, base_params, combos, tea_mode_snapshot, results_path),
+        daemon=True,
     )
-    sweep_extra.empty()
+    t.start()
+    state['thread'] = t
+    st.session_state[state_key] = state
+    st.session_state['sweep_active'] = state_key
+    return state_key
 
-    # Build DataFrame
-    df_results = pd.DataFrame(results_rows)
 
-    # Move "error" column to the end for readability
+def _render_sweep(state):
+    """Render progress + (partial or final) results from the shared state.
+
+    Returns True while the sweep is still running (so the caller knows whether
+    to keep auto-refreshing).
+    """
+    with state['lock']:
+        rows = list(state['results_rows'])
+        err_rows = list(state['error_rows'])
+        times = list(state['times_per_run'])
+        completed = state['completed']
+        running = state['running']
+        started_at = state['started_at']
+        finished_at = state['finished_at']
+        current_overrides = dict(state.get('current_overrides') or {})
+        n_total = state['n_total']
+        labels = state['labels']
+        sweep_values = state['sweep_values']
+        results_path = state['results_path']
+
+    # ---- Controls ----------------------------------------------------------
+    if running:
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            if st.button("⏹️ Stop sweep", type="secondary",
+                         use_container_width=True, key="sweep_stop_btn"):
+                state['stop'].set()
+                st.warning("Stopping after the current run finishes…")
+        with c2:
+            st.caption("The sweep runs in the background — you can change "
+                       "sidebar values, switch tabs, or let the screen idle "
+                       "without interrupting it. It stops only when you press "
+                       "Stop or it finishes.")
+
+    # ---- Progress ----------------------------------------------------------
+    now = time.time()
+    elapsed = (finished_at or now) - started_at
+    frac = (completed / n_total) if n_total else 1.0
+    st.progress(min(max(frac, 0.0), 1.0))
+
+    if times:
+        avg = sum(times) / len(times)
+        if running:
+            eta = avg * max(n_total - completed, 0)
+            eta_text = (f"avg/run **{_fmt_duration(avg)}** · "
+                        f"ETA **{_fmt_duration(eta)}**")
+        else:
+            eta_text = f"avg/run **{_fmt_duration(avg)}**"
+    else:
+        eta_text = "ETA: estimating after first run…"
+
+    if running:
+        ov_text = " · ".join(
+            f"{labels.get(k, k)}="
+            f"{(v if not isinstance(v, float) else f'{v:.4g}')}"
+            for k, v in current_overrides.items()
+        ) or "…"
+        st.info(f"**Run {min(completed + 1, n_total)} of {n_total}** · "
+                f"elapsed **{_fmt_duration(elapsed)}** · {eta_text}")
+        st.caption(f"Current overrides: {ov_text}")
+    else:
+        n_ok = len([r for r in rows if not r.get('error')])
+        n_fail = len(err_rows)
+        if state['stop'].is_set() and completed < n_total:
+            st.warning(f"⏹️ Sweep stopped — {completed} of {n_total} run(s) "
+                       f"completed in **{_fmt_duration(elapsed)}** "
+                       f"({n_ok} ok, {n_fail} failed). Press **Run Sweep** "
+                       f"again to resume from here.")
+        else:
+            st.success(f"✅ Sweep complete — {completed} run(s) in "
+                       f"**{_fmt_duration(elapsed)}** "
+                       f"({n_ok} ok, {n_fail} failed)")
+
+    if not rows:
+        return running
+
+    # ---- Results table -----------------------------------------------------
+    df_results = pd.DataFrame(rows)
     if 'error' in df_results.columns:
         cols = [c for c in df_results.columns if c != 'error'] + ['error']
         df_results = df_results[cols]
 
-    st.markdown("### 📋 Results preview")
+    st.markdown("### 📋 Results"
+                + ("  ·  *live*" if running else " preview"))
     st.dataframe(df_results, use_container_width=True, hide_index=True)
 
-    # CSV download
+    # CSV download — works mid-sweep (downloads whatever is done so far).
     csv_bytes = df_results.to_csv(index=False).encode('utf-8')
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     st.download_button(
-        label="⬇️ Download results as CSV",
+        label=("⬇️ Download results so far (CSV)" if running
+               else "⬇️ Download results as CSV"),
         data=csv_bytes,
         file_name=f"extraction_sweep_{timestamp}.csv",
         mime="text/csv",
         type="primary",
         use_container_width=True,
+        key="sweep_csv_dl",
     )
 
-    # Errors panel
-    if error_rows:
-        with st.expander(
-                f"⚠️ {len(error_rows)} run(s) failed — details",
-                expanded=False):
-            df_errors = pd.DataFrame(error_rows)
-            st.dataframe(df_errors, use_container_width=True,
-                         hide_index=True)
+    if err_rows:
+        with st.expander(f"⚠️ {len(err_rows)} run(s) failed — details",
+                         expanded=False):
+            st.dataframe(pd.DataFrame(err_rows),
+                         use_container_width=True, hide_index=True)
 
-    # Quick visualisation when exactly one parameter was swept and
-    # there's a price column with at least 2 successful results
-    if 'error' in df_results.columns:
-        successful = df_results[df_results['error'] == '']
-    else:
-        successful = df_results
-    if (len(sweep_values) == 1 and len(successful) >= 2 and
-            'product_price_USD_per_kg' in successful.columns):
-        only_key = list(sweep_values.keys())[0]
-        if only_key in successful.columns:
+    # ---- Single-parameter sensitivity plot (only once finished) ------------
+    if not running:
+        successful = (df_results[df_results['error'] == '']
+                      if 'error' in df_results.columns else df_results)
+        if (len(sweep_values) == 1 and len(successful) >= 2 and
+                'product_price_USD_per_kg' in successful.columns):
+            only_key = list(sweep_values.keys())[0]
+            if only_key in successful.columns:
+                try:
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    ax.plot(successful[only_key],
+                            successful['product_price_USD_per_kg'],
+                            marker='o')
+                    ax.set_xlabel(labels.get(only_key, only_key))
+                    ax.set_ylabel('Min. product price ($/kg)')
+                    ax.set_title('Sensitivity of product price to '
+                                 f'{labels.get(only_key, only_key)}')
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
+                except Exception:
+                    pass
+
+        # Offer a clean slate for the next run.
+        if st.button("🗑️ Clear saved progress for this configuration",
+                     key="sweep_clear_btn"):
             try:
-                fig, ax = plt.subplots(figsize=(8, 5))
-                ax.plot(successful[only_key],
-                        successful['product_price_USD_per_kg'],
-                        marker='o')
-                ax.set_xlabel(sweep_summary_labels.get(only_key, only_key))
-                ax.set_ylabel('Min. product price ($/kg)')
-                ax.set_title('Sensitivity of product price to '
-                             f'{sweep_summary_labels.get(only_key, only_key)}')
-                ax.grid(True, alpha=0.3)
-                st.pyplot(fig)
+                if os.path.exists(results_path):
+                    os.remove(results_path)
             except Exception:
-                pass  # Plotting is a nice-to-have, not critical
+                pass
+            st.session_state.pop('sweep_active', None)
+            st.rerun()
+
+    return running
+
+
+if sim_mode == "Single Run" and run_simulation:
+    with _SIM_LOCK:
+        _run_one_simulation(_collect_base_params(), display=True)
+
+elif sim_mode == "Parameter Sweep" and (run_sweep
+                                        or st.session_state.get('sweep_active')):
+    # ── Launch on button press (freezes ALL params at this instant, so any
+    #    later sidebar fiddling cannot change an in-flight sweep) ──────────
+    if run_sweep:
+        _base_params = _collect_base_params()
+        _combos = _build_combinations(sweep_values)
+        _start_sweep(sweep_values, _base_params, _combos, tea_mode,
+                     sweep_summary_labels)
+
+    _active_key = st.session_state.get('sweep_active')
+    _state = st.session_state.get(_active_key) if _active_key else None
+
+    if _state is None:
+        st.info("No active sweep. Tick the parameters to vary in the sidebar, "
+                "set their ranges, then press **Run Sweep**.")
+    else:
+        st.subheader(f"\U0001F504 Parameter Sweep — {_state['n_total']} run(s)")
+        _swept_list = ", ".join(
+            f"`{_state['labels'].get(k, k)}`" for k in _state['sweep_values'])
+        st.caption(f"Varying: {_swept_list}")
+
+        # Live, decoupled rendering. With st.fragment only the progress panel
+        # refreshes on a timer — the sidebar is never rebuilt by the refresh,
+        # so it stays fully interactive while the sweep runs. On older
+        # Streamlit without st.fragment we fall back to a whole-script poll.
+        if hasattr(st, "fragment") and _state['running']:
+            @st.fragment(run_every=2.0)
+            def _live_sweep_panel():
+                if not _render_sweep(_state):
+                    st.rerun()  # finished → drop out to the static render path
+            _live_sweep_panel()
+        else:
+            _still_running = _render_sweep(_state)
+            if _still_running:
+                time.sleep(1.5)
+                st.rerun()
 
 else:
     # Welcome message
