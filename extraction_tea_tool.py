@@ -805,6 +805,15 @@ TEA_DEFAULTS_FOAK = {
     'solv_storage_days': 5,
 }
 
+# Keys that the 'TEA Parameters' dropdown (Nth Plant / FOAK) controls --
+# i.e. exactly the assumptions the interactive Nth/FOAK block assigns. The
+# operator wage, electricity price, feed price and storage days are set
+# independently in the sidebar (from their own data sources / inputs) and
+# must NOT be overridden when a reactor choice forces FOAK in a sweep.
+_TEA_SIDEBAR_KEYS = {'operator_hourly_wage', 'elec_price', 'feed_price',
+                     'feed_storage_days', 'solv_storage_days'}
+TEA_MODE_KEYS = frozenset(TEA_DEFAULTS_FOAK) - _TEA_SIDEBAR_KEYS
+
 # Sidebar - Input Parameters
 st.sidebar.header("📊 Input Parameters")
 
@@ -3146,7 +3155,7 @@ def _sweep_worker(state, base_params, combos, tea_mode_snapshot, results_path):
         if (tea_mode_snapshot == "Nth Plant"
                 and params.get('reactor_type') == 'ultrasound'):
             params.update({k: v for k, v in TEA_DEFAULTS_FOAK.items()
-                           if k in params})
+                           if k in TEA_MODE_KEYS})
             params.update(overrides)  # explicit swept values still win
             _forced_foak = True
 
