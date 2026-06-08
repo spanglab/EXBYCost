@@ -41,11 +41,25 @@ warnings.filterwarnings("ignore", message=".*overflow encountered in exp.*")
 # Evaporator + Spray Dryer classes
 # ============================================================================
 
-def suggest_pressures(solvent_ID, n_effects=3, T_high_C=None, delta_T_C=20):
-    """Generate evaporator pressure tuple from solvent Psat curve."""
+def suggest_pressures(solvent_ID, n_effects=3, T_high_C=None, delta_T_C=20,
+                      feed_T_C=None, margin_C=2.0):
+    """Generate evaporator pressure tuple from solvent Psat curve.
+
+    The first effect is normally placed at the solvent atmospheric boiling
+    point (Tb). If the feed arrives hotter than Tb (feed_T_C above Tb), the
+    first effect is instead placed at the feed temperature plus a small
+    margin, so the evaporator runs pressurised at the feed boiling point
+    rather than cooling the feed. This keeps the feed saturated rather than
+    superheated and avoids the condenser inverted-temperature spec. Feeds at
+    or below Tb are unaffected (the max keeps T_high_C at Tb).
+    """
     chem = tmo.settings.chemicals[solvent_ID]
+    Tb_C = chem.Tb - 273.15
     if T_high_C is None:
-        T_high_C = chem.Tb - 273.15
+        T_high_C = Tb_C
+    if feed_T_C is not None:
+        # First effect must boil at or above the feed temperature.
+        T_high_C = max(T_high_C, feed_T_C + margin_C)
     temps_K = [T_high_C + 273.15 - i * delta_T_C for i in range(n_effects)]
     pressures = [chem.Psat(T) for T in temps_K]
     return tuple(round(p) for p in pressures)
@@ -1741,7 +1755,7 @@ def _run_one_simulation(p, *, display=True):
             # ── Evaporator + Spray Dryer ──────────────────────────────
             solvent_CAS = tmo.settings.chemicals[solv].CAS
             evap_P = suggest_pressures(solv, n_effects=evap_n_effects,
-                                       delta_T_C=20)
+                                       delta_T_C=20, feed_T_C=ExtractT)
 
             E301 = CorrectedMEE('Evaporator',
                 ins=extract,
