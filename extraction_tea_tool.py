@@ -77,6 +77,7 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
     def _run(self):
         out_wt_solids, liq = self.outs
         ins = self.ins
+        self._flash_fallback_used = False
         if self.V == 0:
             out_wt_solids.copy_like(ins[0])
             liq.empty()
@@ -88,49 +89,69 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
 
         if self.V_definition == 'Overall':
             P = tuple(self.P)
-            self.P = list(P)
-            for i in range(self._N_evap - 1):
-                if self._V_overall(0.) > self.V:
-                    self.P.pop()
-                    self._load_components()
-                    self._reload_components = True
+            try:
+                self.P = list(P)
+                for i in range(self._N_evap - 1):
+                    if self._V_overall(0.) > self.V:
+                        self.P.pop()
+                        self._load_components()
+                        self._reload_components = True
+                    else:
+                        break
+                self.P = P
+                n_eff = max(1, self._N_evap)
+                V_ub = min(self.V, self.V / n_eff * 1.5, 0.35)
+                f = self._V_overall_objective_function
+                # f(V_first) is monotonically increasing. The pop loop above
+                # guarantees f(0) <= 0; the remaining bracket-crash mode is
+                # that the heuristic cap V_ub is too low to reach the target
+                # overall V (dilute feeds), so f(V_ub) <= 0 too -> "opposite
+                # signs". The 0.35 cap is an energy-distribution heuristic,
+                # not a correctness bound, so grow the upper bound toward the
+                # physical ceiling until a sign change exists.
+                f_lo = f(0.0)
+                f_hi = f(V_ub)
+                V_ceiling = 0.999
+                while f_lo * f_hi > 0.0 and V_ub < V_ceiling:
+                    V_ub = min(V_ceiling, (V_ub * 1.5) if V_ub > 1e-6 else 0.05)
+                    try:
+                        f_hi = f(V_ub)
+                    except Exception:
+                        break
+                if f_lo * f_hi > 0.0:
+                    # Target overall V unreachable even at the ceiling: clamp
+                    # to the closest feasible bound (records a result rather
+                    # than crashing; concentrate misses its solids target).
+                    self._V_first_effect = V_ub if abs(f_hi) < abs(f_lo) else 0.0
+                    f(self._V_first_effect)  # restore cascade state at pick
                 else:
-                    break
-            self.P = P
-            n_eff = max(1, self._N_evap)
-            V_ub = min(self.V, self.V / n_eff * 1.5, 0.35)
-            f = self._V_overall_objective_function
-            # f(V_first) is monotonically increasing. The pop loop above
-            # guarantees f(0) <= 0; the remaining crash mode is that the
-            # heuristic cap V_ub is too low to reach the target overall V
-            # (dilute feeds), so f(V_ub) <= 0 too and the bracket is
-            # degenerate -> "f(x0) and f(x1) must have opposite signs".
-            # The 0.35 cap is an energy-distribution heuristic, not a
-            # correctness bound, so grow the upper bound toward the physical
-            # ceiling until a sign change exists instead of raising.
-            f_lo = f(0.0)
-            f_hi = f(V_ub)
-            V_ceiling = 0.999
-            while f_lo * f_hi > 0.0 and V_ub < V_ceiling:
-                V_ub = min(V_ceiling, (V_ub * 1.5) if V_ub > 1e-6 else 0.05)
+                    guess = self._V_first_effect
+                    if guess is None or not (0.0 <= guess <= V_ub):
+                        guess = 0.5 * V_ub
+                    self._V_first_effect = flx.IQ_interpolation(
+                        f, 0., V_ub, f_lo, f_hi, guess,
+                        xtol=1e-4, ytol=1e-3, checkiter=False)
+            except Exception as e:
+                # GUARD 1 (V-solve). Reached ONLY when the proper solve above
+                # raised -- typically a VLE flash inside _V_overall that could
+                # not bracket against the V=1 edge ("failed to find bracket")
+                # for a volatile solvent carrying non-volatile solute. Points
+                # that solve normally never enter here. Keep the target
+                # overall V (what the output split needs) and set the
+                # first-effect fraction to the cap so cost/energy stay finite.
+                self.P = P
                 try:
-                    f_hi = f(V_ub)
+                    self._reload_components = True
+                    self._load_components()
                 except Exception:
-                    break
-            if f_lo * f_hi > 0.0:
-                # Target overall V unreachable even at the ceiling: clamp to
-                # the closest feasible bound so the run records a result
-                # rather than crashing. The concentrate will miss its solids
-                # target, which is visible in the downstream streams.
-                self._V_first_effect = V_ub if abs(f_hi) < abs(f_lo) else 0.0
-                f(self._V_first_effect)  # restore cascade state at the pick
-            else:
-                guess = self._V_first_effect
-                if guess is None or not (0.0 <= guess <= V_ub):
-                    guess = 0.5 * V_ub
-                self._V_first_effect = flx.IQ_interpolation(
-                    f, 0., V_ub, f_lo, f_hi, guess,
-                    xtol=1e-4, ytol=1e-3, checkiter=False)
+                    pass
+                n_eff = max(1, self._N_evap)
+                self._V_first_effect = min(self.V, self.V / n_eff * 1.5, 0.35)
+                self._flash_fallback_used = True
+                warnings.warn(
+                    "CorrectedMEE: V-solve flash did not converge "
+                    f"({type(e).__name__}: {e}); using limiting-split "
+                    "fallback for this point.")
             V_overall = self.V
         else:
             V_overall = self._V_overall(self.V)
@@ -138,10 +159,42 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
         evaporators = self.evaporators
         last_evaporator = evaporators[-1]
 
-        self.condenser._run()
-        liq = self.mixer.outs[0]
-        liq.P = self.ins[0].P
-        liq.mix_from(self.mixer.ins, conserve_phases=True)
+        def _assign_limiting_split():
+            # Unambiguous limiting split for a degenerate near-complete
+            # vaporization: the volatile solvent boils off to the target
+            # remaining amount, every non-volatile component stays in the
+            # liquid concentrate. Pure mass split (no VLE call) so it cannot
+            # itself raise. Used only by the fallback branches.
+            chem_id = self.chemical
+            feed_s = self.ins[0]
+            solvent_in = feed_s.imol[chem_id]
+            liq_solvent = min(solvent_in,
+                              max(0.0, solvent_in * (1.0 - V_overall)))
+            vap_solvent = max(0.0, solvent_in - liq_solvent)
+            out_wt_solids.copy_like(feed_s)
+            out_wt_solids.imol[chem_id] = liq_solvent
+            out_wt_solids.P = self.ins[0].P
+            liq.empty()
+            liq.phase = 'g'
+            liq.imol[chem_id] = vap_solvent
+            liq.T = feed_s.T
+            liq.P = self.ins[0].P
+
+        try:
+            self.condenser._run()
+            liq = self.mixer.outs[0]
+            liq.P = self.ins[0].P
+            liq.mix_from(self.mixer.ins, conserve_phases=True)
+        except Exception as e:
+            # GUARD 2 (condenser/mixer). Only if condensing the combined
+            # vapor failed to converge. Assign the limiting split and finish.
+            self._flash_fallback_used = True
+            warnings.warn(
+                "CorrectedMEE: condenser flash did not converge "
+                f"({type(e).__name__}: {e}); using limiting-split fallback.")
+            _assign_limiting_split()
+            liq.P = out_wt_solids.P
+            return
 
         # --- CORRECTED VLE output assignment ---
         if self.flash:
@@ -166,15 +219,30 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                     objective, 0., V_max,
                     xtol=1e-4, ytol=1e-3, checkiter=False)
             except Exception:
-                lo, hi = 0.0, V_max
-                for _ in range(15):
-                    mid = (lo + hi) / 2
-                    if objective(mid) > 0:
-                        lo = mid
-                    else:
-                        hi = mid
-                mixed_stream.copy_flow(feed)
-                mixed_stream.vle(P=last_evaporator.P, V=(lo + hi) / 2)
+                try:
+                    # Existing bisection rescue first: handles non-degenerate
+                    # IQ_interpolation misses without changing their outcome.
+                    lo, hi = 0.0, V_max
+                    for _ in range(15):
+                        mid = (lo + hi) / 2
+                        if objective(mid) > 0:
+                            lo = mid
+                        else:
+                            hi = mid
+                    mixed_stream.copy_flow(feed)
+                    mixed_stream.vle(P=last_evaporator.P, V=(lo + hi) / 2)
+                except Exception as e:
+                    # GUARD 3 (final flash). Both the solver and the bisection
+                    # re-flash failed -> genuinely degenerate flash. Assign the
+                    # limiting split directly and finish.
+                    self._flash_fallback_used = True
+                    warnings.warn(
+                        "CorrectedMEE: output flash did not converge "
+                        f"({type(e).__name__}: {e}); using limiting-split "
+                        "fallback.")
+                    _assign_limiting_split()
+                    liq.P = out_wt_solids.P
+                    return
 
             out_wt_solids.mol = mixed_stream.imol['l']
             if liq.phase == 'l':
