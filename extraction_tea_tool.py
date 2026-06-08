@@ -85,13 +85,38 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
             self.P = P
             n_eff = max(1, self._N_evap)
             V_ub = min(self.V, self.V / n_eff * 1.5, 0.35)
-            # Reset cached guess to avoid stale values from prior iterations
-            if self._V_first_effect is not None and self._V_first_effect > V_ub:
-                self._V_first_effect = V_ub * 0.5
-            self._V_first_effect = flx.IQ_interpolation(
-                self._V_overall_objective_function,
-                0., V_ub, None, None, self._V_first_effect,
-                xtol=1e-4, ytol=1e-3, checkiter=False)
+            f = self._V_overall_objective_function
+            # f(V_first) is monotonically increasing. The pop loop above
+            # guarantees f(0) <= 0; the remaining crash mode is that the
+            # heuristic cap V_ub is too low to reach the target overall V
+            # (dilute feeds), so f(V_ub) <= 0 too and the bracket is
+            # degenerate -> "f(x0) and f(x1) must have opposite signs".
+            # The 0.35 cap is an energy-distribution heuristic, not a
+            # correctness bound, so grow the upper bound toward the physical
+            # ceiling until a sign change exists instead of raising.
+            f_lo = f(0.0)
+            f_hi = f(V_ub)
+            V_ceiling = 0.999
+            while f_lo * f_hi > 0.0 and V_ub < V_ceiling:
+                V_ub = min(V_ceiling, (V_ub * 1.5) if V_ub > 1e-6 else 0.05)
+                try:
+                    f_hi = f(V_ub)
+                except Exception:
+                    break
+            if f_lo * f_hi > 0.0:
+                # Target overall V unreachable even at the ceiling: clamp to
+                # the closest feasible bound so the run records a result
+                # rather than crashing. The concentrate will miss its solids
+                # target, which is visible in the downstream streams.
+                self._V_first_effect = V_ub if abs(f_hi) < abs(f_lo) else 0.0
+                f(self._V_first_effect)  # restore cascade state at the pick
+            else:
+                guess = self._V_first_effect
+                if guess is None or not (0.0 <= guess <= V_ub):
+                    guess = 0.5 * V_ub
+                self._V_first_effect = flx.IQ_interpolation(
+                    f, 0., V_ub, f_lo, f_hi, guess,
+                    xtol=1e-4, ytol=1e-3, checkiter=False)
             V_overall = self.V
         else:
             V_overall = self._V_overall(self.V)
