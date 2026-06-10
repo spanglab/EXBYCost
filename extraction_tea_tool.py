@@ -78,6 +78,7 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
         out_wt_solids, liq = self.outs
         ins = self.ins
         self._flash_fallback_used = False
+        self._vub_direct_bound_used = False
         if self.V == 0:
             out_wt_solids.copy_like(ins[0])
             liq.empty()
@@ -102,16 +103,26 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                 n_eff = max(1, self._N_evap)
                 V_ub = min(self.V, self.V / n_eff * 1.5, 0.35)
                 f = self._V_overall_objective_function
-                # f(V_first) is monotonically increasing. The pop loop above
-                # guarantees f(0) <= 0; the remaining bracket-crash mode is
-                # that the heuristic cap V_ub is too low to reach the target
-                # overall V (dilute feeds), so f(V_ub) <= 0 too -> "opposite
-                # signs". The 0.35 cap is an energy-distribution heuristic,
-                # not a correctness bound, so grow the upper bound toward the
-                # physical ceiling until a sign change exists.
+                # f(V_first) is monotonically increasing, and the pop loop
+                # above guarantees f(0) <= 0. For normal (concentrated) feeds
+                # the tight heuristic cap already brackets the root, so it is
+                # used as-is (unchanged speed). For dilute feeds it is too low
+                # (f(V_ub) <= 0 as well -- the old 'opposite signs' crash).
+                # Instead of groping outward with a geometric search (each
+                # step a full cascade flash, which dominated dilute
+                # high-solvflow runs), jump straight to a bound GUARANTEED to
+                # bracket: overall vaporization is always >= the first-effect
+                # fraction, so f at V_first = self.V is >= 0. One extra
+                # evaluation instead of several.
                 f_lo = f(0.0)
                 f_hi = f(V_ub)
                 V_ceiling = 0.999
+                if f_lo * f_hi > 0.0:
+                    V_ub = min(self.V, V_ceiling)
+                    f_hi = f(V_ub)
+                    self._vub_direct_bound_used = True
+                # Safety net: if the guaranteed bound somehow does not bracket
+                # (numerical edge), fall back to the original outward search.
                 while f_lo * f_hi > 0.0 and V_ub < V_ceiling:
                     V_ub = min(V_ceiling, (V_ub * 1.5) if V_ub > 1e-6 else 0.05)
                     try:
@@ -283,18 +294,25 @@ class SolventSprayDryer(bst.Unit):
     def _run(self):
         feed = self.ins[0]
         vapor, solids = self.outs
+        # Dry at no less than the feed temperature. If the concentrate
+        # arrives hotter than the dryer setpoint (Tb + 10 K) -- e.g. a hot
+        # acetone feed from a pressurised evaporator -- operate at the feed
+        # temperature rather than trying to cool to the setpoint, which
+        # would hand the heat utility an inverted ('inlet must be cooler
+        # than outlet if heating') spec. Cooler feeds keep the setpoint.
+        T_out = max(self.T, feed.T)
         solids.copy_like(feed)
         vapor.empty()
         if solids.F_mass <= 0:
             vapor.phase = 'g'; return
         current_frac = solids.imass[self.solvent] / solids.F_mass
         if current_frac <= self.moisture_content:
-            vapor.phase = 'g'; vapor.T = self.T; solids.T = self.T; return
+            vapor.phase = 'g'; vapor.T = T_out; solids.T = T_out; return
         vapor.copy_flow(solids, self.solvent, remove=True)
         separations.adjust_moisture_content(
             solids, vapor, self.moisture_content, ID=self.solvent)
         vapor.phase = 'g'
-        vapor.T = self.T; solids.T = self.T
+        vapor.T = T_out; solids.T = T_out
         solids.P = feed.P; vapor.P = feed.P
 
     def _design(self):
@@ -303,7 +321,8 @@ class SolventSprayDryer(bst.Unit):
         duty = self.H_out - self.H_in
         if abs(duty) > 0:
             actual_duty = duty / self.thermal_efficiency
-            self.add_heat_utility(actual_duty, T_in=self.ins[0].T, T_out=self.T)
+            T_out = max(self.T, self.ins[0].T)
+            self.add_heat_utility(actual_duty, T_in=self.ins[0].T, T_out=T_out)
 
 
 # ============================================================================
