@@ -418,6 +418,7 @@ st.title("EXBYCost")
 st.markdown(
     "##### A fast, flexible techno-economic modeling tool for estimating "
     "extraction costs from food processing byproducts"
+    "developed by the Spang lab at the University of California, Davis"
 )
 st.markdown("---")
 
@@ -881,11 +882,37 @@ solv = st.sidebar.selectbox(
 if solv in solvprice_index:
     st.sidebar.caption(f"Using **${solvprice_index[solv]:.4f}/kg**")
 
-solvflow = st.sidebar.number_input(
-    "Solvent Flow Rate (kg/hr)",
-    min_value=10.0, max_value=1000000.0, value=1000.0, step=10.0,
-    help="Mass flow rate of solvent fed to the extractor."
+solv_flow_mode = st.sidebar.radio(
+    "Solvent Flow Specification",
+    options=["Exact flow (kg/hr)", "Solvent/feed ratio"],
+    help="Specify the solvent feed either directly as a mass flow rate, or as "
+         "a mass ratio of solvent to feed. In ratio mode the solvent flow is "
+         "computed as ratio × feed flow (so it tracks the feed flow, including "
+         "when feed flow is varied in a sweep)."
 )
+
+if solv_flow_mode == "Exact flow (kg/hr)":
+    solvflow = st.sidebar.number_input(
+        "Solvent Flow Rate (kg/hr)",
+        min_value=10.0, max_value=1000000.0, value=1000.0, step=10.0,
+        help="Mass flow rate of solvent fed to the extractor."
+    )
+    solv_feed_ratio = (solvflow / feedflow) if feedflow else 0.0
+    st.sidebar.caption(
+        f"→ Solvent/feed ratio = **{solv_feed_ratio:.3g} kg/kg**"
+    )
+else:
+    solv_feed_ratio = st.sidebar.number_input(
+        "Solvent/Feed Ratio (kg/kg)",
+        min_value=0.01, max_value=1000.0, value=2.5, step=0.1,
+        help="Mass ratio of solvent to feed. The solvent flow rate is computed "
+             "as this ratio × feed flow rate."
+    )
+    solvflow = solv_feed_ratio * feedflow
+    st.sidebar.caption(
+        f"→ Solvent flow = **{solvflow:,.2f} kg/hr** "
+        f"({solv_feed_ratio:.3g} × {feedflow:,.0f} kg/hr feed)"
+    )
 
 ExtractT = st.sidebar.number_input(
     "Solvent Temperature (°C)",
@@ -1538,6 +1565,13 @@ def _run_one_simulation(p, *, display=True):
     feedflow                = p['feedflow']
     solv                    = p['solv']
     solvflow                = p['solvflow']
+    # In solvent/feed-ratio mode, derive the solvent flow from the (possibly
+    # swept) feed flow so the ratio is held constant. Falls back gracefully
+    # for params dicts that predate this option.
+    if p.get('solv_flow_mode') == "Solvent/feed ratio":
+        _ratio = p.get('solv_feed_ratio')
+        if _ratio is not None:
+            solvflow = _ratio * feedflow
     ExtractT                = p['ExtractT']
     extractt                = p['extractt']
     Particlesize            = p['Particlesize']
@@ -3084,6 +3118,8 @@ def _collect_base_params():
         'feedflow':                 feedflow,
         'solv':                     solv,
         'solvflow':                 solvflow,
+        'solv_flow_mode':           solv_flow_mode,
+        'solv_feed_ratio':          solv_feed_ratio,
         'ExtractT':                 ExtractT,
         'extractt':                 extractt,
         'Particlesize':             Particlesize,
@@ -3492,7 +3528,7 @@ else:
     - Select from multiple feedstock types
     - Customize process conditions (temperature, flow rates, extraction time)
     - Choose reactor type (conventional, ultrasound-assisted, or microwave-assisted)
-    - Adjust economic parameters (IRR, depreciation, operating costs)
+    - Adjust economic parameters (IRR, depreciation, operating costs, ect)
     - View detailed capital and operating cost breakdowns
     - Calculate minimum selling price for extract
     - **Parameter sweep mode**: vary one or more inputs over a range
@@ -3508,7 +3544,7 @@ else:
        section, set their ranges and #points, then click "Run Sweep"
        and download the CSV when finished.
 
-    **Note:** Make sure you have the `SolidSolventExtractor` module in your working directory.
+any questions or queries, contact KHeeley@ucdavis.edu, refer to EXBYCost in the subject
     """)
 
 # Footer
