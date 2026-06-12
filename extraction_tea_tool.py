@@ -418,8 +418,8 @@ st.title("EXBYCost")
 st.markdown(
     "##### A fast, flexible techno-economic modeling tool for estimating "
     "extraction costs from food processing byproducts"
-    "developed by the Spang lab at the University of California, Davis"
-)
+   )
+st.markdown( "developed by the Spang lab at the University of California, Davis")
 st.markdown("---")
 
 # ── Helper to extract plain name from a feedstock chem entry (str or dict) ──
