@@ -407,6 +407,179 @@ class SolidCooler(bst.Unit):
 
         self.design_results['Heat transfer area'] = max(A_ft2, 0.001)
         self.add_heat_utility(duty, T_in=T_hot_in, T_out=T_hot_out)
+
+
+# ============================================================================
+# Feedstock Drum Dryer (indirect steam-tube rotary drum dryer)
+# ============================================================================
+@cost('Heat transfer area', CE=567, units='ft^2', BM=2.06,
+      cost=1520, S=1, n=0.80)
+class FeedDrumDryer(bst.Unit):
+    """
+    Rotary drum dryer for the incoming (as-received) feedstock.
+
+    Placed upstream of feedstock storage, this unit dries the wet biomass
+    down to a target moisture content before it goes into the storage tank.
+    Two reasons this matters in practice:
+
+    1. Storage stability. Wet biomass stored in bulk moulds, self-heats and
+       loses extractable compounds. Below ~10 wt% moisture microbial and
+       enzymatic activity is largely arrested; ~6 wt% is the usual target
+       for stable long-term storage of dried botanical material
+       [Chen et al. 2015; Emery & Mosier 2012].
+    2. Water carried into the process. Feed moisture is a non-solvent
+       impurity: it dilutes the extract, loads the evaporator, raises the
+       purge required to hold the recycle-loop impurity cap, and ends up
+       as residual water in the dried product. Removing it here, once,
+       with a cheap bulk dryer is far cheaper than removing it repeatedly
+       from the solvent loop.
+
+    Moisture is specified on a wet basis (kg water / kg wet solids), the
+    same convention as `SolventSprayDryer.moisture_content`.
+
+    Parameters
+    ----------
+    moisture_ID : str
+        Chemical evaporated. Default 'Water'.
+    moisture_content : float
+        Target outlet moisture, wet basis [kg/kg]. Default 0.06 (6 wt%).
+    T : float
+        Solids/vapor outlet temperature [K]. Default 363.15 K (90 degC).
+    thermal_efficiency : float
+        Fraction of the supplied heat that reaches the solids. Default 0.70,
+        typical for indirect steam-tube rotary dryers (0.6-0.85)
+        [Mujumdar, Handbook of Industrial Drying, 4th ed., Ch. 2].
+    U : float
+        Overall heat-transfer coefficient [W/(m2 K)] on the tube area.
+        Default 60 - mid-range for steam-tube rotary dryers on wet granular
+        solids (literature 30-85 W/(m2 K)) [Perry's Ch. 12].
+    T_medium : float | None
+        Heating-medium temperature [K] used for the LMTD when sizing the
+        tube area. Default None -> taken from the selected heating agent,
+        clamped to [T_out + 10 K, T_out + 120 K] so that a very hot agent
+        (e.g. natural-gas firing) does not produce an unphysically small
+        drum.
+
+    Cost basis
+    ----------
+    Indirect-heat steam-tube rotary dryer, Seider, Seader, Lewin & Widagdo
+    (2017), Table 16.32:
+
+        Cp = 1,520 * A^0.80   [USD, stainless steel]
+
+    with A = heat-transfer (tube) area [ft2]. Valid range 100-1,400 ft2;
+    CE = 567, BM = 2.06. This is the same correlation already used for the
+    product cooler (`SolidCooler`), which the reference gives as a combined
+    rotary dryer/cooler basis.
+
+    Notes
+    -----
+    The duty is built explicitly (sensible heat on the whole feed to the
+    drying temperature + latent heat on the evaporated moisture) rather than
+    from `H_out - H_in`. The feed stream is declared as a solid phase, so an
+    enthalpy-difference duty would charge the solid->gas transition of the
+    moisture (heat of sublimation, ~2,830 kJ/kg) instead of the heat of
+    vaporisation of liquid water (~2,280 kJ/kg at 90 degC), overstating the
+    steam demand by roughly 15-20%.
+    """
+    _units = {'Heat transfer area': 'ft^2',
+              'Evaporation rate': 'kg/hr'}
+    _N_ins = 1
+    _N_outs = 2   # [0] = vapor, [1] = dried solids
+
+    def _init(self, moisture_ID='Water', moisture_content=0.06,
+              T=363.15, thermal_efficiency=0.70, U=60.0, T_medium=None):
+        self.moisture_ID = moisture_ID
+        self.moisture_content = moisture_content
+        self.T = T
+        self.thermal_efficiency = thermal_efficiency
+        self.U = U
+        self.T_medium = T_medium
+
+    # -- mass balance ----------------------------------------------------
+    def _run(self):
+        feed = self.ins[0]
+        vapor, solids = self.outs
+        T_out = max(self.T, feed.T)
+
+        solids.copy_like(feed)
+        vapor.empty()
+        vapor.phase = 'g'
+
+        if solids.F_mass <= 0:
+            return
+
+        current_frac = solids.imass[self.moisture_ID] / solids.F_mass
+        if current_frac <= self.moisture_content:
+            # Already at or below the target - nothing to evaporate. Leave
+            # the feed untouched (and cold): no drying duty is charged.
+            solids.P = feed.P
+            vapor.T = feed.T
+            vapor.P = feed.P
+            return
+
+        vapor.copy_flow(solids, self.moisture_ID, remove=True)
+        separations.adjust_moisture_content(
+            solids, vapor, self.moisture_content, ID=self.moisture_ID)
+        vapor.phase = 'g'
+        solids.phase = feed.phase
+        solids.T = vapor.T = T_out
+        solids.P = vapor.P = feed.P
+
+    # -- duty + sizing ---------------------------------------------------
+    def _design(self):
+        feed = self.ins[0]
+        vapor, solids = self.outs
+
+        m_evap = vapor.F_mass                       # kg/hr
+        self.design_results['Evaporation rate'] = m_evap
+
+        if m_evap <= 1e-9:
+            # Pass-through (feed already dry enough): no drum, no duty.
+            self.design_results['Heat transfer area'] = 0.001
+            return
+
+        T_in = feed.T
+        T_out = max(self.T, T_in)
+
+        # Sensible heat on the as-received feed + latent heat on the water
+        # actually evaporated. See the class docstring for why this is not
+        # taken as H_out - H_in.
+        duty_sensible = feed.C * (T_out - T_in)     # kJ/hr  (feed.C: kJ/hr/K)
+        chem = tmo.settings.chemicals[self.moisture_ID]
+        try:
+            Hvap = chem.Hvap(min(T_out, chem.Tb))   # J/mol
+        except Exception:
+            Hvap = chem.Hvap(chem.Tb)
+        duty_latent = vapor.F_mol * Hvap            # kmol/hr * J/mol = kJ/hr
+        duty = duty_sensible + duty_latent
+
+        actual_duty = duty / self.thermal_efficiency
+        self.add_heat_utility(actual_duty, T_in=T_in, T_out=T_out)
+
+        # Tube area from Q = U * A * LMTD against the heating medium.
+        T_med = self.T_medium
+        if T_med is None:
+            try:
+                T_med = bst.settings.heating_agents[0].T
+            except Exception:
+                T_med = None
+        if T_med is None:
+            T_med = T_out + 50.0
+        T_med = min(max(T_med, T_out + 10.0), T_out + 120.0)
+
+        dT1 = T_med - T_in
+        dT2 = T_med - T_out
+        if abs(dT1 - dT2) < 0.01:
+            LMTD = dT1
+        else:
+            LMTD = (dT1 - dT2) / log(dT1 / dT2)
+
+        Q_W = abs(actual_duty) * 1000 / 3600        # kJ/hr -> W
+        A_m2 = Q_W / (self.U * max(LMTD, 1.0))
+        self.design_results['Heat transfer area'] = max(A_m2 * 10.7639, 0.001)
+
+
 st.set_page_config(
     page_title="EXBYCost",
     page_icon="🧪",
@@ -961,6 +1134,99 @@ else:
     ExtractP_custom = None
 
 # =========================================================================
+# 2a. Feedstock Drying (pre-storage)
+# =========================================================================
+st.sidebar.subheader("2a. Feedstock Drying")
+
+_as_received_moisture = feedstocks[selected_feedstock]['moisture']
+st.sidebar.caption(
+    f"As-received moisture: **{_as_received_moisture * 100:.1f} wt%**"
+)
+
+feed_dry_enable = st.sidebar.checkbox(
+    "Dry Feedstock Before Storage",
+    value=True,
+    help=("Rotary drum dryer on the as-received feedstock, upstream of the "
+          "storage tank. Drying before storage prevents mould, self-heating "
+          "and loss of extractables in the pile, and stops feed moisture "
+          "being carried through extraction into the solvent loop and the "
+          "final product.")
+)
+
+FEED_DRY_STABLE_STORAGE = 0.06  # 6 wt% — stable long-term storage target
+
+# A dryer can only take water OUT, so the target moisture is bounded above
+# by the moisture that actually arrives with the selected feedstock. The
+# slider/box limits therefore track the feedstock, not a fixed 60%.
+_max_moisture_pct = max(round(_as_received_moisture * 100, 1), 0.2)
+_min_moisture_pct = min(0.5, _max_moisture_pct / 2.0)
+_default_moisture_pct = min(max(round(FEED_DRY_STABLE_STORAGE * 100, 1),
+                                _min_moisture_pct), _max_moisture_pct)
+
+feed_dry_spec = st.sidebar.radio(
+    "Target Feed Moisture",
+    options=["6% — stable long-term storage", "Custom"],
+    help=("6 wt% (wet basis) is the standard target for stable long-term "
+          "storage of dried biomass — below roughly 10 wt% microbial and "
+          "enzymatic activity is arrested, and 6 wt% leaves margin for "
+          "moisture pick-up in the tank. Choose Custom to set your own "
+          "target (e.g. a milder dry if the compounds of interest are "
+          "heat-sensitive, or a harder dry to keep more water out of the "
+          "solvent loop). The target is capped at the as-received moisture "
+          "of the selected feedstock — the dryer cannot add water."),
+    disabled=not feed_dry_enable,
+)
+
+if feed_dry_spec == "Custom":
+    feed_dry_moisture = st.sidebar.number_input(
+        "Custom Feed Moisture (wt%)",
+        min_value=float(_min_moisture_pct),
+        max_value=float(_max_moisture_pct),
+        value=float(_default_moisture_pct), step=0.5,
+        format="%.1f",
+        help=(f"Moisture in the dried feedstock leaving the drum dryer, "
+              f"wet basis (kg water / kg wet solids). Upper limit is the "
+              f"as-received moisture of "
+              f"{selected_feedstock} ({_max_moisture_pct:.1f} wt%) — at "
+              f"that value the dryer is a pass-through."),
+        disabled=not feed_dry_enable,
+    ) / 100.0
+else:
+    # Never target a moisture the feed does not have.
+    feed_dry_moisture = min(FEED_DRY_STABLE_STORAGE, _as_received_moisture)
+
+feed_dry_T = st.sidebar.number_input(
+    "Feed Drying Temperature (°C)",
+    min_value=40.0, max_value=200.0, value=90.0, step=5.0,
+    help="Solids outlet temperature in the drum dryer. Higher is faster and "
+         "needs less heat-transfer area, but thermolabile target compounds "
+         "are flagged against this temperature in the degradation check.",
+    disabled=not feed_dry_enable,
+)
+
+if feed_dry_enable:
+    if feed_dry_moisture >= _as_received_moisture:
+        st.sidebar.info(
+            f"Target ({feed_dry_moisture * 100:.1f}%) is at or above the "
+            f"as-received moisture ({_as_received_moisture * 100:.1f}%) — "
+            f"the dryer will pass the feed through with no evaporation."
+        )
+    else:
+        # Wet-basis balance: dry solids are conserved.
+        _dry_solids = feedflow * (1.0 - _as_received_moisture)
+        _dried_feed = _dry_solids / (1.0 - feed_dry_moisture)
+        _water_out = feedflow - _dried_feed
+        st.sidebar.caption(
+            f"→ Evaporates **{_water_out:,.1f} kg/hr** water; "
+            f"**{_dried_feed:,.1f} kg/hr** to storage"
+        )
+
+# Dried feed is cooled to ambient before it enters the storage tank —
+# storing hot dried biomass causes condensation on the tank walls and
+# re-wetting of the pile.
+FEED_COOL_T = 298.15  # K (25 °C)
+
+# =========================================================================
 # 2b. Post-Extraction Concentration Settings
 # =========================================================================
 st.sidebar.subheader("2b. Concentration & Drying")
@@ -983,6 +1249,13 @@ dryer_moisture = st.sidebar.slider(
 # Cooling settings (hardcoded — no user input needed)
 solid_cooler_U = 25  # W/(m²·K), typical for indirect rotary coolers
                      # with organic powders (Nhuchhen et al. 2016; Perry's §11)
+
+# Feedstock drum-dryer settings (hardcoded — no user input needed)
+feed_dryer_efficiency = 0.70  # fraction of supplied heat reaching the solids;
+                              # typical for indirect steam-tube rotary dryers
+                              # (Mujumdar, Handbook of Industrial Drying, Ch. 2)
+feed_dryer_U = 60             # W/(m²·K) on the tube area, steam-tube rotary
+                              # dryer on wet granular solids (Perry's §12)
 
 # =========================================================================
 # 2c. Solvent Recycle
@@ -1324,6 +1597,11 @@ else:
 # the sweep range, a printf-style format, and the cast for sweep values
 # (None = float, int = round-to-int + dedupe).
 NUMERIC_SWEEP_SPECS = {
+    # Feed drying (pre-storage drum dryer)
+    # Upper bound tracks the selected feedstock: drying can only remove the
+    # water that arrives with the feed.
+    'feed_dry_moisture':  {'label': 'Feed moisture after drying (frac)', 'min': 0.005, 'max': float(_as_received_moisture), 'def_lo': min(0.04, float(_as_received_moisture)), 'def_hi': min(0.15, float(_as_received_moisture)), 'fmt': '%.4f', 'cast': None, 'group': 'Feed drying'},
+    'feed_dry_T':         {'label': 'Feed drying temperature (°C)',      'min': 40.0,  'max': 200.0,'def_lo': 60.0, 'def_hi': 120.0,'fmt': '%.1f',  'cast': None, 'group': 'Feed drying'},
     # Process
     'feedflow':        {'label': 'Feed flow rate (kg/hr)',           'min': 10.0,   'max': 1000000.0, 'def_lo': 200.0,    'def_hi': 800.0,    'fmt': '%.2f',  'cast': None, 'group': 'Process'},
     'solvflow':        {'label': 'Solvent flow rate (kg/hr)',        'min': 10.0,   'max': 1000000.0, 'def_lo': 500.0,    'def_hi': 2000.0,   'fmt': '%.2f',  'cast': None, 'group': 'Process'},
@@ -1389,7 +1667,8 @@ if sim_mode == "Parameter Sweep":
     )
 
     # Numeric sweeps, organised by group
-    groups_ordered = ['Process', 'Concentration', 'Recycle', 'Economics', 'TEA']
+    groups_ordered = ['Process', 'Feed drying', 'Concentration', 'Recycle',
+                      'Economics', 'TEA']
     for group in groups_ordered:
         group_keys = [k for k, s in NUMERIC_SWEEP_SPECS.items()
                       if s['group'] == group]
@@ -1579,6 +1858,9 @@ def _run_one_simulation(p, *, display=True):
     heatutility             = p['heatutility']
     pressure_mode           = p['pressure_mode']
     ExtractP_custom         = p.get('ExtractP_custom')
+    feed_dry_enable         = p.get('feed_dry_enable', True)
+    feed_dry_moisture       = p.get('feed_dry_moisture', 0.06)
+    feed_dry_T              = p.get('feed_dry_T', 90.0)
     evap_n_effects          = int(p['evap_n_effects'])
     evap_target_solids      = p['evap_target_solids']
     dryer_moisture          = p['dryer_moisture']
@@ -1655,6 +1937,11 @@ def _run_one_simulation(p, *, display=True):
             feedchems = [_get_chem_name(c) for c in feedchem_entries]   # plain name list
             feedcomp = feedstocks[selected_feedstock]['comp']
             moisture = feedstocks[selected_feedstock]['moisture']
+            # The drum dryer removes water; it cannot add it. If a sweep
+            # pairs a drying target with a feedstock that arrives drier
+            # than that target, hold the target at the incoming moisture
+            # (the dryer then passes the feed straight through).
+            feed_dry_moisture = min(feed_dry_moisture, moisture)
             feedstock_type = feedstocks[selected_feedstock]['type']
             porosity_tortuosity_ratio = porosity_torosity[feedstock_type]
 
@@ -1821,6 +2108,11 @@ def _run_one_simulation(p, *, display=True):
                 units='kg/hr'
             )
 
+            # Feedstock drying (pre-storage) streams
+            feed_dryer_vapor = bst.Stream('feed_dryer_vapor')  # water vented
+            dried_feed = bst.Stream('dried_feed')      # out of the drum dryer
+            cooled_feed = bst.Stream('cooled_feed')    # cooled → to storage
+
             solid_residual = bst.Stream('solid_residual')
             extract = bst.Stream('extract')  # intermediate → goes to evaporator
             condensate = bst.Stream('condensate')  # recovered solvent
@@ -1843,7 +2135,42 @@ def _run_one_simulation(p, *, display=True):
                 mixed_recycle = bst.Stream('mixed_recycle')
 
             # Define units
-            S101 = units.StorageTank('Feedstock storage', feed, tau=Fstoret)
+            # ── Feedstock drying (upstream of storage) ────────────────
+            # The as-received feed is dried in a rotary drum dryer and
+            # cooled back to ambient BEFORE it enters the storage tank, so
+            # that (a) the stored pile is stable (no mould / self-heating /
+            # loss of extractables), and (b) the feed moisture never enters
+            # the extractor, where it would dilute the extract, load the
+            # evaporator, force a bigger purge to hold the recycle impurity
+            # cap, and end up as water in the dried product.
+            #
+            #   feed → D101 (drum dryer) → C101 (cooler) → S101 → U101 → U102
+            #             └→ feed_dryer_vapor (vented)
+            #
+            # Drying is skipped entirely when disabled, in which case the
+            # wet feed goes straight to storage (original topology).
+            if feed_dry_enable:
+                D101 = FeedDrumDryer('Feedstock drum dryer',
+                    ins=feed,
+                    outs=[feed_dryer_vapor, dried_feed],
+                    moisture_ID='Water',
+                    moisture_content=feed_dry_moisture,
+                    T=feed_dry_T + 273.15,
+                    thermal_efficiency=feed_dryer_efficiency,
+                    U=feed_dryer_U)
+                C101 = SolidCooler('Dried feed cooler',
+                    ins=dried_feed,
+                    outs=[cooled_feed],
+                    T_target=FEED_COOL_T,
+                    U=solid_cooler_U)
+                _feed_to_storage = C101 - 0
+            else:
+                D101 = None
+                C101 = None
+                _feed_to_storage = feed
+
+            S101 = units.StorageTank('Feedstock storage', _feed_to_storage,
+                                     tau=Fstoret)
             U101 = units.ConveyingBelt('Feed transport', S101 - 0)
             U102 = Mill('Feed grinding', U101 - 0, particle_radius=Particlesize)
 
@@ -2126,6 +2453,9 @@ def _run_one_simulation(p, *, display=True):
                 M1._run()
                 U103._run()
                 U105._run()
+                if feed_dry_enable:
+                    D101._run()
+                    C101._run()
                 S101._run()
                 U101._run()
                 U102._run()
@@ -2345,6 +2675,15 @@ def _run_one_simulation(p, *, display=True):
                 'ExtractT_C':           ExtractT,
                 'extractt_hr':          extractt,
                 'particle_radius_cm':   Particlesize,
+                'feed_dry_enable':      feed_dry_enable,
+                'feed_dry_moisture':    (feed_dry_moisture if feed_dry_enable
+                                         else moisture),
+                'feed_dry_T_C':         (feed_dry_T if feed_dry_enable
+                                         else None),
+                'feed_moisture_as_received': moisture,
+                'feed_water_evaporated_kg_per_hr': (
+                    float(feed_dryer_vapor.F_mass) if feed_dry_enable else 0.0),
+                'feed_to_storage_kg_per_hr': float(S101.ins[0].F_mass),
                 'evap_n_effects':       evap_n_effects,
                 'evap_target_solids':   evap_target_solids,
                 'dryer_moisture':       dryer_moisture,
@@ -2448,12 +2787,16 @@ def _run_one_simulation(p, *, display=True):
                 except Exception:
                     _T_evap_C = float(_solv_chem.Tb - 273.15)
                 _T_dry_C = float(SD1.T - 273.15)
+                _T_feed_dry_C = (float(D101.T - 273.15)
+                                 if feed_dry_enable else None)
                 degradation_info = {
                     'heating_column': _heat_col,
                     'T_extractor_C': round(_T_extract_C, 1),
                     'T_evaporator_C': round(_T_evap_C, 1),
                     'T_dryer_C': round(_T_dry_C, 1),
                 }
+                if _T_feed_dry_C is not None:
+                    degradation_info['T_feed_dryer_C'] = round(_T_feed_dry_C, 1)
 
                 _chem_meta = build_chem_meta(feedchem_entries)
 
@@ -2472,7 +2815,17 @@ def _run_one_simulation(p, *, display=True):
                                      'chebi': _meta.get('chebi')})
                     return recs
 
-                _exposures = [
+                _exposures = []
+                # The feedstock drum dryer sees every compound in the raw
+                # feed, at the drying temperature — so thermolabile targets
+                # can be lost before extraction even starts.
+                if feed_dry_enable and D101.outs[0].F_mass > 1e-9:
+                    _exposures.append(
+                        {'unit': 'Feedstock drum dryer (D101)',
+                         'column': 'drying',
+                         'temp_C': _T_feed_dry_C,
+                         'chemicals': _records_in(feed)})
+                _exposures += [
                     {'unit': 'Extractor (E201)',  'column': _heat_col,
                      'temp_C': _T_extract_C, 'chemicals': _records_in(feed)},
                     {'unit': 'Evaporator (E301)', 'column': _heat_col,
@@ -2936,17 +3289,22 @@ def _run_one_simulation(p, *, display=True):
                                  use_container_width=True, hide_index=True)
 
                     # Overall mass balance: in = feed + makeup ;
-                    # out = solid_residual + cooled_product + purge
+                    # out = feed-dryer vapor + solid_residual
+                    #       + cooled_product + purge
+                    F_feed_vap = (feed_dryer_vapor.F_mass
+                                  if feed_dry_enable else 0.0)
                     F_in  = feed.F_mass + F_makeup
-                    F_out = (solid_residual.F_mass + cooled_product.F_mass
-                             + F_purge)
+                    F_out = (F_feed_vap + solid_residual.F_mass
+                             + cooled_product.F_mass + F_purge)
                     closure_err = F_in - F_out
                     st.markdown("**Overall mass balance**")
                     mb_rows = [
                         {'Stream': 'IN  : feed + fresh makeup',
                          'kg/hr': f'{F_in:,.3f}'},
+                        {'Stream': 'OUT : feed-dryer vapor',
+                         'kg/hr': f'{F_feed_vap:,.3f}'},
                         {'Stream': 'OUT : residual + dried product + purge',
-                         'kg/hr': f'{F_out:,.3f}'},
+                         'kg/hr': f'{F_out - F_feed_vap:,.3f}'},
                         {'Stream': 'Closure error',
                          'kg/hr': f'{closure_err:+.3e}'},
                     ]
@@ -2956,9 +3314,12 @@ def _run_one_simulation(p, *, display=True):
                     st.markdown("---")
 
                 # Display key streams
-                streams_to_display = [feed, solvent, solid_residual,
-                                      extract, condensate, dried_product,
-                                      cooled_product]
+                streams_to_display = [feed]
+                if feed_dry_enable:
+                    streams_to_display += [feed_dryer_vapor, cooled_feed]
+                streams_to_display += [solvent, solid_residual,
+                                       extract, condensate, dried_product,
+                                       cooled_product]
                 if enable_recycle:
                     # Insert recycle-loop streams so the user can inspect
                     # composition at every node of the loop.
@@ -2971,6 +3332,8 @@ def _run_one_simulation(p, *, display=True):
                 # composition tables below.
                 def _stage_label(u):
                     ul = str(u).lower()
+                    if 'feed' in ul and 'dry' in ul:
+                        return 'Feed dryer'
                     if 'extract' in ul:
                         return 'Extractor'
                     if 'evapor' in ul:
@@ -3021,7 +3384,19 @@ def _run_one_simulation(p, *, display=True):
                     _col = degradation_info.get('heating_column', 'water')
                     _col_label = ('Heating (Water)' if _col == 'water'
                                   else 'Heating (Other Solvent)')
-                    c1, c2, c3 = st.columns(3)
+                    _T_fd = degradation_info.get('T_feed_dryer_C')
+                    if _T_fd is None:
+                        c1, c2, c3 = st.columns(3)
+                        c0 = None
+                    else:
+                        c0, c1, c2, c3 = st.columns(4)
+                    if c0 is not None:
+                        with c0:
+                            st.metric("Feed-dryer exposure",
+                                      f"{_T_fd:.1f} °C",
+                                      help="Drum dryer on the as-received "
+                                           "feedstock, upstream of storage. "
+                                           "Checked against the “Drying” column")
                     with c1:
                         st.metric("Extractor exposure",
                                   f"{degradation_info.get('T_extractor_C', 0):.1f} °C",
@@ -3031,7 +3406,7 @@ def _run_one_simulation(p, *, display=True):
                                   f"{degradation_info.get('T_evaporator_C', 0):.1f} °C",
                                   help=f"Checked against the “{_col_label}” column")
                     with c3:
-                        st.metric("Dryer exposure",
+                        st.metric("Product-dryer exposure",
                                   f"{degradation_info.get('T_dryer_C', 0):.1f} °C",
                                   help="Checked against the “Drying” column")
 
@@ -3127,6 +3502,9 @@ def _collect_base_params():
         'heatutility':              heatutility,
         'pressure_mode':            pressure_mode,
         'ExtractP_custom':          ExtractP_custom,
+        'feed_dry_enable':          feed_dry_enable,
+        'feed_dry_moisture':        feed_dry_moisture,
+        'feed_dry_T':               feed_dry_T,
         'evap_n_effects':           evap_n_effects,
         'evap_target_solids':       evap_target_solids,
         'dryer_moisture':           dryer_moisture,
@@ -3526,6 +3904,9 @@ else:
 
     **Features:**
     - Select from multiple feedstock types
+    - Dry the feedstock before storage (rotary drum dryer, default 6 wt%
+      moisture for stable long-term storage) so the stored pile is stable
+      and feed water is not carried into the solvent loop or the product
     - Customize process conditions (temperature, flow rates, extraction time)
     - Choose reactor type (conventional, ultrasound-assisted, or microwave-assisted)
     - Adjust economic parameters (IRR, depreciation, operating costs, ect)
@@ -3538,8 +3919,10 @@ else:
     **Instructions:**
     1. Select a feedstock from the dropdown
     2. Configure process settings (feed flow, solvent, temperature, reactor type, etc.)
-    3. Adjust TEA settings (start year, IRR, depreciation method, etc.)
-    4. *Single Run:* click "Run Simulation" to see the full report.
+    3. Set the feedstock drying target (6% is the stock answer for stable
+       long-term storage; pick "Custom" to enter your own)
+    4. Adjust TEA settings (start year, IRR, depreciation method, etc.)
+    5. *Single Run:* click "Run Simulation" to see the full report.
        *Parameter Sweep:* tick the parameters to vary in the sweep
        section, set their ranges and #points, then click "Run Sweep"
        and download the CSV when finished.
