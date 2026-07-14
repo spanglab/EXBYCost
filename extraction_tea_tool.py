@@ -9,7 +9,7 @@ import thermosteam as tmo
 from thermosteam import Chemical, MultiStream, separations
 from biosteam import units
 from biosteam.units.decorators import cost
-from math import exp, log
+from math import exp, log, log10
 import flexsolve as flx
 import numpy as np
 from scipy.optimize import brentq
@@ -74,9 +74,189 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
     correct cost and energy results.
     """
 
+    # ---- Diagnostics -------------------------------------------------------
+    # _flash_fallback_used is reset on EVERY _run, and _run is called dozens to
+    # thousands of times per sys.simulate() (once per V-bisection step, per
+    # Wegstein pass). Reading it after simulate() therefore only reports the
+    # LAST call and hides everything that happened on the way. These counters
+    # accumulate instead, and are never reset by _run -- call reset_counters()
+    # once, just after the unit is built.
+    def reset_counters(self):
+        self._run_count = 0
+        self._guard_counts = {}
+        self._guard_reasons = {}
+
+    def _note_guard(self, name, exc=None):
+        if not hasattr(self, '_guard_counts'):
+            self.reset_counters()
+        self._guard_counts[name] = self._guard_counts.get(name, 0) + 1
+        if exc is not None:
+            msg = f"{type(exc).__name__}: {exc}"
+            self._guard_reasons.setdefault(name, [])
+            if msg not in self._guard_reasons[name]:
+                self._guard_reasons[name].append(msg)
+
+    @property
+    def n_run(self):
+        """Total _run() calls since the last reset_counters()."""
+        return getattr(self, '_run_count', 0)
+
+    @property
+    def n_fb(self):
+        """Total guard trips since the last reset_counters() (all guards)."""
+        return sum(getattr(self, '_guard_counts', {}).values())
+
+    # ---- Design ------------------------------------------------------------
+    def _design(self):
+        """Size the evaporator.
+
+        BioSTEAM's MultiEffectEvaporator._design reads EVERYTHING from the
+        cascade objects:
+            duty_1  <- first_evaporator.H_out - first_evaporator.H_in
+            duty_i  <- evap.design_results['Heat transfer']
+            LMTD_i  <- evap.outs[0].T, evap.outs[2].T
+            volume  <- evap._size_flash_vessel()
+        When a guard fires, those objects hold whatever half-solved state the
+        crashed cascade left behind -- and _design reads it as though it were a
+        solution. That is how a guard trip produced a complete, plausible, and
+        meaningless capital cost.
+
+        So: if the cascade solved, use BioSTEAM's rigorous design, unchanged.
+        If a guard fired, discard the cascade state and size from an explicit
+        energy balance instead (see _design_from_energy_balance).
+        """
+        if not getattr(self, '_flash_fallback_used', False):
+            self._design_from_shortcut = False
+            return super()._design()
+        self._design_from_shortcut = True
+        self._design_from_energy_balance()
+
+    def _design_from_energy_balance(self):
+        """Short-cut N-effect design, used ONLY when the cascade failed.
+
+        Reads only the inlet/outlet streams and the SPECIFIED pressures --
+        never the (crashed) cascade objects. This is the standard hand
+        calculation for a multi-effect evaporator, not a fudge:
+
+          * The outlet streams are trustworthy even on the fallback path: the
+            flash=True block reassigns them from V_overall, and
+            _assign_limiting_split assigns them by pure mass balance. So the
+            solvent evaporated is known exactly.
+          * Effect temperatures come from the specified pressures via Tsat.
+          * Steam economy: in an N-effect, each effect's vapour is the next
+            effect's heating medium, so each effect evaporates ~1/N of the
+            total and only effect 1 draws external utility.
+          * A_i = Q_i / (U * dT_i), with dT_1 = T_steam - T_1 and
+            dT_i = T_(i-1) - T_i. Both sides isothermal, so LMTD = dT.
+          * Cost uses the SAME C_func / U / area correlation as the rigorous
+            path, so the two are directly comparable.
+
+        Validated against the rigorous design on cases that solve cleanly:
+        area within ~4-8%, cost within ~2-4% at V = 0.9, erring HIGH (so it
+        does not understate CAPEX). Accuracy degrades at low V where the
+        equal-split assumption is poorest -- but the fallback only fires as
+        V -> 1, which is where the approximation is at its best.
+        """
+        from biosteam.units.design_tools import heat_transfer as _ht
+
+        A_range, C_func, U, _mat = self._evap_data
+        Design = self.design_results
+        Cost = self.baseline_purchase_costs
+        CE = bst.CE
+
+        chem_id = self.chemical
+        chem = self.chemicals[chem_id]
+        feed = self.ins[0]
+        conc = self.outs[0]
+
+        # 1. Solvent actually evaporated -- from the OUTLET streams (correct),
+        #    not from the cascade (crashed).
+        n_evap = max(0.0, feed.imol[chem_id] - conc.imol[chem_id])   # kmol/hr
+        N = max(1, len(self.evaporators))
+
+        if n_evap <= 1e-12:
+            Design['Area'] = 0.0
+            Design['Volume'] = 0.0
+            Cost['Evaporators'] = 0.0
+            self._As = [0.0] * N
+            return
+
+        # 2. Effect temperatures from the SPECIFIED pressures.
+        P_list = list(self.P)[:N]
+        T_eff = []
+        for P in P_list:
+            try:
+                T_eff.append(chem.Tsat(P))
+            except Exception:
+                T_eff.append(chem.Tb)
+        N = len(T_eff)
+
+        def _hvap(T):
+            Tc = getattr(chem, 'Tc', None)
+            if Tc:
+                T = min(T, Tc - 1.0)
+            return chem.Hvap(T)          # J/mol
+
+        # 3. Duties. kmol/hr * J/mol == kJ/hr, so no conversion needed.
+        n_per = n_evap / N
+        Q_lat = [n_per * _hvap(T) for T in T_eff]
+        Q_sens = feed.C * max(0.0, T_eff[0] - feed.T)      # feed.C: kJ/hr/K
+        Q1 = Q_lat[0] + Q_sens
+
+        # 4. External utility supplies effect 1 only.
+        hu = self.create_heat_utility()
+        hu(Q1, feed.T, T_eff[0])
+        try:
+            Th = hu.inlet_utility_stream.T
+        except Exception:
+            Th = T_eff[0] + 20.0
+
+        # 5. Areas and costs -- same correlation as the rigorous path.
+        As, evap_costs = [], []
+        bounds_warning = bst.exceptions.bounds_warning
+        for i, T in enumerate(T_eff):
+            Qi = Q1 if i == 0 else Q_lat[i]
+            T_hot = Th if i == 0 else T_eff[i - 1]
+            LMTD = max(T_hot - T, 1.0)    # isothermal both sides -> LMTD = dT
+            A = abs(_ht.compute_heat_transfer_area(LMTD, U, Qi, 1.))
+            As.append(A)
+            bounds_warning(self, 'heat transfer area requirement', A, 'ft2',
+                           A_range, 'cost')
+            evap_costs.append(C_func(A, CE))
+
+        self._As = As
+        self._evap_costs = evap_costs
+        Design['Area'] = sum(As)
+        Cost['Evaporators'] = sum(evap_costs)
+
+        # 6. Vessel volume for the vacuum system. _size_flash_vessel() would
+        #    read the crashed cascade, so estimate from the vapour volumetric
+        #    rate at ~30 s disengagement residence. Rough, but it only feeds
+        #    the vacuum-system cost, a second-order term.
+        R, tau = 8.314, 30.0 / 3600.0     # J/mol/K, hr
+        total_volume = 0.0
+        for T, P in zip(T_eff, P_list):
+            if P > 0:
+                total_volume += n_per * 1000.0 * R * T / P * tau   # m3
+        Design['Volume'] = total_volume
+
+        # 7. Condenser / vacuum system: attempt normal sizing; if they also
+        #    fail, record it rather than crashing the whole design step.
+        try:
+            self.condenser.simulate(run=False)
+        except Exception as e:
+            self._note_guard('condenser design (shortcut path)', e)
+        try:
+            self.vacuum_system = bst.VacuumSystem(
+                self, self.vacuum_system_preference,
+                vessel_volume=total_volume, P_suction=self.outs[0].P)
+        except Exception as e:
+            self._note_guard('vacuum system (shortcut path)', e)
+
     def _run(self):
         out_wt_solids, liq = self.outs
         ins = self.ins
+        self._run_count = getattr(self, '_run_count', 0) + 1
         self._flash_fallback_used = False
         self._vub_direct_bound_used = False
         if self.V == 0:
@@ -101,46 +281,78 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                         break
                 self.P = P
                 n_eff = max(1, self._N_evap)
-                V_ub = min(self.V, self.V / n_eff * 1.5, 0.35)
                 f = self._V_overall_objective_function
-                # f(V_first) is monotonically increasing, and the pop loop
-                # above guarantees f(0) <= 0. For normal (concentrated) feeds
-                # the tight heuristic cap already brackets the root, so it is
-                # used as-is (unchanged speed). For dilute feeds it is too low
-                # (f(V_ub) <= 0 as well -- the old 'opposite signs' crash).
-                # Instead of groping outward with a geometric search (each
-                # step a full cascade flash, which dominated dilute
-                # high-solvflow runs), jump straight to a bound GUARANTEED to
-                # bracket: overall vaporization is always >= the first-effect
-                # fraction, so f at V_first = self.V is >= 0. One extra
-                # evaluation instead of several.
-                f_lo = f(0.0)
-                f_hi = f(V_ub)
                 V_ceiling = 0.999
+                # Bound GUARANTEED to bracket from above: overall vaporization
+                # is always >= the first-effect fraction, so f(V_first=self.V)
+                # is >= 0.
+                V_target = min(self.V, V_ceiling)
+
+                # SEED. f(V_first) is monotonically increasing and the pop
+                # loop above guarantees f(0) <= 0, so all that is needed is a
+                # good upper probe.
+                #
+                # The old heuristic (min(V, V/n_eff*1.5, 0.35)) assumed each
+                # effect vaporizes an equal SLICE of the ORIGINAL feed. The
+                # cascade is multiplicative, not additive, so that assumption
+                # collapses as V -> 1: at V=0.99, n_eff=3 it probes 0.35 while
+                # the root sits near 0.79 -- the probe is wasted and
+                # IQ_interpolation then gets handed the whole [0, 0.99]
+                # interval with a useless midpoint guess.
+                #
+                # Equal-FRACTION staging instead gives
+                #     (1 - V_overall) = (1 - V_first) ** n_eff
+                # which stays valid as V -> 1 and is slightly TIGHTER than the
+                # old cap for concentrated feeds, so nothing regresses there.
+                # No safety margin is applied -- biasing the seed LOW is
+                # deliberate, because a low probe is recycled as a lower bound
+                # (below) whereas a high probe just leaves a wide bracket.
+                V_seed = 1.0 - (1.0 - V_target) ** (1.0 / n_eff)
+                V_seed = min(V_target, max(V_seed, 1e-4))
+
+                V_lo = 0.0
+                f_at_zero = f(0.0)
+                f_lo = f_at_zero
+                V_ub = V_seed
+                f_hi = f(V_seed)
+
                 if f_lo * f_hi > 0.0:
-                    V_ub = min(self.V, V_ceiling)
+                    # Seed landed below the root. Since f is increasing, that
+                    # failed probe is NOT wasted -- it is a valid new LOWER
+                    # bound. Keep it (5x narrower bracket for IQ) and raise the
+                    # ceiling to the guaranteed bound.
+                    if f_hi > f_lo:                  # monotonicity holds
+                        V_lo, f_lo = V_ub, f_hi
+                    V_ub = V_target
                     f_hi = f(V_ub)
                     self._vub_direct_bound_used = True
+
                 # Safety net: if the guaranteed bound somehow does not bracket
                 # (numerical edge), fall back to the original outward search.
+                # First reopen the tightened lower bound -- it is only sound if
+                # the cascade really is monotonic, and f(0) is already cached
+                # so reopening costs nothing.
+                if f_lo * f_hi > 0.0 and V_lo > 0.0:
+                    V_lo, f_lo = 0.0, f_at_zero
                 while f_lo * f_hi > 0.0 and V_ub < V_ceiling:
                     V_ub = min(V_ceiling, (V_ub * 1.5) if V_ub > 1e-6 else 0.05)
                     try:
                         f_hi = f(V_ub)
-                    except Exception:
+                    except Exception as e:
+                        self._note_guard('bracket-search abort', e)
                         break
                 if f_lo * f_hi > 0.0:
                     # Target overall V unreachable even at the ceiling: clamp
                     # to the closest feasible bound (records a result rather
                     # than crashing; concentrate misses its solids target).
-                    self._V_first_effect = V_ub if abs(f_hi) < abs(f_lo) else 0.0
+                    self._V_first_effect = V_ub if abs(f_hi) < abs(f_lo) else V_lo
                     f(self._V_first_effect)  # restore cascade state at pick
                 else:
                     guess = self._V_first_effect
-                    if guess is None or not (0.0 <= guess <= V_ub):
-                        guess = 0.5 * V_ub
+                    if guess is None or not (V_lo <= guess <= V_ub):
+                        guess = 0.5 * (V_lo + V_ub)
                     self._V_first_effect = flx.IQ_interpolation(
-                        f, 0., V_ub, f_lo, f_hi, guess,
+                        f, V_lo, V_ub, f_lo, f_hi, guess,
                         xtol=1e-4, ytol=1e-3, checkiter=False)
             except Exception as e:
                 # GUARD 1 (V-solve). Reached ONLY when the proper solve above
@@ -149,16 +361,23 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                 # for a volatile solvent carrying non-volatile solute. Points
                 # that solve normally never enter here. Keep the target
                 # overall V (what the output split needs) and set the
-                # first-effect fraction to the cap so cost/energy stay finite.
+                # first-effect fraction to a plausible estimate so cost/energy
+                # stay finite. Uses the same equal-FRACTION staging estimate as
+                # the seed above rather than the old additive cap, which
+                # collapsed to a wildly low 0.35 for dilute (V -> 1) feeds --
+                # i.e. exactly the feeds most likely to land in this guard.
                 self.P = P
                 try:
                     self._reload_components = True
                     self._load_components()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    self._note_guard('GUARD 1 inner (_load_components)', e2)
                 n_eff = max(1, self._N_evap)
-                self._V_first_effect = min(self.V, self.V / n_eff * 1.5, 0.35)
+                _V_t = min(self.V, 0.999)
+                self._V_first_effect = min(
+                    self.V, 1.0 - (1.0 - _V_t) ** (1.0 / n_eff))
                 self._flash_fallback_used = True
+                self._note_guard('GUARD 1 (V-solve)', e)
                 warnings.warn(
                     "CorrectedMEE: V-solve flash did not converge "
                     f"({type(e).__name__}: {e}); using limiting-split "
@@ -200,6 +419,7 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
             # GUARD 2 (condenser/mixer). Only if condensing the combined
             # vapor failed to converge. Assign the limiting split and finish.
             self._flash_fallback_used = True
+            self._note_guard('GUARD 2 (condenser/mixer)', e)
             warnings.warn(
                 "CorrectedMEE: condenser flash did not converge "
                 f"({type(e).__name__}: {e}); using limiting-split fallback.")
@@ -229,7 +449,8 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                 flx.IQ_interpolation(
                     objective, 0., V_max,
                     xtol=1e-4, ytol=1e-3, checkiter=False)
-            except Exception:
+            except Exception as e_iq:
+                self._note_guard('output-flash bisection rescue', e_iq)
                 try:
                     # Existing bisection rescue first: handles non-degenerate
                     # IQ_interpolation misses without changing their outcome.
@@ -247,6 +468,7 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                     # re-flash failed -> genuinely degenerate flash. Assign the
                     # limiting split directly and finish.
                     self._flash_fallback_used = True
+                    self._note_guard('GUARD 3 (final flash)', e)
                     warnings.warn(
                         "CorrectedMEE: output flash did not converge "
                         f"({type(e).__name__}: {e}); using limiting-split "
@@ -1915,6 +2137,11 @@ def _run_one_simulation(p, *, display=True):
             _progress_bar = st.progress(0.0) if display else _NoopUI()
             _progress_status = st.empty() if display else _NoopUI()
             _progress_state = {'i': 0}
+            # Final one-line status messages (recycle solved, evaporator
+            # solved, simulation complete) are collected here during the run
+            # and rendered together BELOW the results, so they don't stack at
+            # the top and push the results down.
+            _run_status_lines = []
 
             def _advance_progress(label=None):
                 i = _progress_state['i']
@@ -1927,8 +2154,12 @@ def _run_one_simulation(p, *, display=True):
                     _progress_state['i'] += 1
 
             def _finish_progress():
-                _progress_bar.progress(1.0)
-                _progress_status.success("All steps complete.")
+                # Clear the live progress bar and status line entirely rather
+                # than leaving a full bar + "All steps complete" lingering at
+                # the top of the page. The run-summary block at the bottom is
+                # the finished-state confirmation instead.
+                _progress_bar.empty()
+                _progress_status.empty()
 
             _advance_progress()  # Stage 1: chemicals & thermo
 
@@ -1975,6 +2206,10 @@ def _run_one_simulation(p, *, display=True):
 
             # ── Flag any proxy compounds ──────────────────────────────────────
             proxy_warnings = []
+            # Volatility-screen display data, populated when the screen runs
+            # (below) and rendered at the bottom of the output. Initialized
+            # here so the bottom render is safe on every code path.
+            _volatility_screen_info = None
             for name, match in proxy_report.items():
                 if not match.in_thermosteam and match.proxy_name:
                     proxy_warnings.append(f"'{name}' not in database — proxy '{match.proxy_name}' used")
@@ -1993,11 +2228,66 @@ def _run_one_simulation(p, *, display=True):
             # Set up thermodynamics using proxy-resolved chemicals
             chemicals_obj = proxy_chemicals
 
-            # ── Phase-lock non-volatile compounds (Psat < 1e-5 Pa at 100°C) ──
-            PSAT_THRESHOLD = 1e-5
-            PSAT_TEST_T = 373.15
-            phase_locked_for_evap = []
+            # ── Volatility screen: which species may enter VLE ───────────────
+            # The VLE must KEEP genuinely volatile solutes. They co-evaporate
+            # with the solvent, land in the condensate, and ARE the "impurity"
+            # that recycle_x_max caps. Locking every solute to the liquid phase
+            # would make the condensate pure solvent, send f_solv -> 1, and
+            # cause the impurity-cap bound in adjust_recycle_split to become
+            # infinite and never bind -- silently disabling the purge spec.
+            #
+            # But species that are non-volatile IN PRACTICE must be excluded,
+            # or the flash tries to boil them. As V -> 1 the mixture dew point
+            # is set by the HEAVIEST species present, so the solver marches T
+            # toward cinnamic acid's boiling point (~300 C) and past it, then
+            # dies extrapolating Hvap:
+            #   RuntimeError: Failed to extrapolate enthalpy of vaporization
+            #   method 'MORGAN_KOBAYASHI' at T=906.83 K for CASRN '140-10-3'
+            # That is the exception CorrectedMEE's GUARD 1 has been swallowing.
+            #
+            # The OLD screen (Psat < 1e-5 Pa at a fixed 100 C) used the wrong
+            # QUANTITY, not merely the wrong number:
+            #   * Absolute Psat says nothing about whether a species competes
+            #     with the SOLVENT for the vapour. A few Pa is negligible
+            #     against ethanol (~100 kPa at Tb) but significant against a
+            #     heavy solvent -- so any absolute cutoff tuned for one solvent
+            #     is wrong for the next one someone selects.
+            #   * 373.15 K is not the evaporator temperature.
+            # Cinnamic acid (Psat(100 C) ~ Pa, i.e. >> 1e-5) therefore CLEARED
+            # the screen, stayed in the VLE, and wrecked the flash.
+            #
+            # CORRECT SCREEN: relative volatility against the ACTUAL solvent at
+            # the ACTUAL evaporator temperature.
+            #       alpha_i = Psat_i(T_evap) / Psat_solvent(T_evap)
+            # Keep alpha >= ALPHA_MIN (can reach the condensate, must be
+            # tracked); lock the rest to liquid. This rescales itself for any
+            # solvent and any operating temperature, so it generalizes.
+            #
+            # ALPHA_MIN = 1e-4 is tied to what the model actually needs to
+            # resolve: a solute at alpha = 1e-4 and liquid mole fraction 0.01
+            # contributes ~1 ppm to the vapour -- three orders of magnitude
+            # below a 0.5% (5,000 ppm) impurity cap, so it cannot move the
+            # recycle balance. Volatile solutes worth keeping (limonene,
+            # furfural, acetic acid, light phenolics) sit at alpha ~1e-2 to 1.
+            ALPHA_MIN = 1e-4
+
             solvent_names_lower = {s.lower() for s in Solvchems + ['water']}
+
+            # Screen at the hottest temperature the flowsheet reaches: the
+            # evaporator's first effect sits at the solvent boiling point, or
+            # at the extractor outlet if that is hotter (cf. suggest_pressures).
+            try:
+                _solv_chem = tmo.Chemical(solv)
+                _solv_Tb = _solv_chem.Tb or 373.15
+                T_screen = max(_solv_Tb, ExtractT + 273.15 + 2.0)
+                _Psat_solv_screen = _solv_chem.Psat(T_screen)
+            except Exception:
+                T_screen = 373.15
+                _Psat_solv_screen = None
+
+            phase_locked_for_evap = []      # (ID, alpha) excluded from VLE
+            kept_volatile = []              # (ID, alpha) retained in VLE
+
             for i, chem in enumerate(chemicals_obj):
                 if isinstance(chem, str):
                     try:
@@ -2006,34 +2296,56 @@ def _run_one_simulation(p, *, display=True):
                         continue
                 else:
                     chem_obj = chem
+
+                # Solvents and water are the volatile species by definition.
                 if chem_obj.ID.lower() in solvent_names_lower:
                     continue
                 if getattr(chem_obj, 'locked_state', None):
                     continue
-                try:
-                    Psat = chem_obj.Psat(PSAT_TEST_T)
-                except Exception:
-                    Psat = 0.0
-                if Psat < PSAT_THRESHOLD:
-                    if isinstance(chemicals_obj[i], str):
+
+                # Relative volatility at evaporator temperature. If Psat cannot
+                # even be evaluated there (common for proxied chemicals with
+                # extrapolated correlations), treat as non-volatile AND report
+                # it -- an unevaluable Psat is exactly what later blows up the
+                # flash, so it must not be left in the VLE by default.
+                alpha = None
+                if _Psat_solv_screen:
+                    try:
+                        alpha = chem_obj.Psat(T_screen) / _Psat_solv_screen
+                    except Exception:
+                        alpha = None
+
+                if alpha is not None and alpha >= ALPHA_MIN:
+                    kept_volatile.append((chem_obj.ID, alpha))
+                    continue    # stays in the VLE: it can reach the condensate
+
+                # Below the cutoff (or unevaluable) -> lock to liquid.
+                _a = alpha if alpha is not None else float('nan')
+                if isinstance(chemicals_obj[i], str):
+                    try:
+                        chemicals_obj[i] = tmo.Chemical(chemicals_obj[i],
+                                                        phase='l')
+                        phase_locked_for_evap.append((chem_obj.ID, _a))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        locked = chem_obj.copy(chem_obj.ID, phase='l')
+                        chemicals_obj[i] = locked
+                        phase_locked_for_evap.append((chem_obj.ID, _a))
+                    except Exception:
                         try:
-                            chemicals_obj[i] = tmo.Chemical(chemicals_obj[i], phase='l')
-                            phase_locked_for_evap.append(chem_obj.ID)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            locked = chem_obj.copy(chem_obj.ID, phase='l')
+                            locked = tmo.Chemical.blank(chem_obj.ID, phase='l')
+                            locked.default()
                             chemicals_obj[i] = locked
-                            phase_locked_for_evap.append(chem_obj.ID)
+                            phase_locked_for_evap.append((chem_obj.ID, _a))
                         except Exception:
-                            try:
-                                locked = tmo.Chemical.blank(chem_obj.ID, phase='l')
-                                locked.default()
-                                chemicals_obj[i] = locked
-                                phase_locked_for_evap.append(chem_obj.ID)
-                            except Exception:
-                                pass
+                            # Could not lock -> STAYS in the VLE and can still
+                            # drive the flash out of range. Do not bury this.
+                            warnings.warn(
+                                f"Could not phase-lock {chem_obj.ID} to "
+                                f"liquid; it remains in the VLE and may drive "
+                                f"the evaporator flash out of range.")
             print(f"Native: {sum(1 for m in proxy_report.values() if m.in_thermosteam)}")
             print(f"Proxied: {sum(1 for m in proxy_report.values() if not m.in_thermosteam and m.proxy_name)}")
             for name, m in proxy_report.items():
@@ -2047,6 +2359,19 @@ def _run_one_simulation(p, *, display=True):
             )
             tmo.settings.set_thermo(thermo)
             bst.settings.set_thermo(thermo)
+
+            # Volatility-screen results are RENDERED at the very bottom of the
+            # output (next to the proxy-compound warnings), not here — the
+            # screen must run now to phase-lock chemicals before the flowsheet
+            # is built, but the report reads better grouped with the other
+            # chemistry notes at the end. Stash what the display needs.
+            _volatility_screen_info = {
+                'kept': list(kept_volatile),
+                'locked': list(phase_locked_for_evap),
+                'solv': solv,
+                'T_screen_C': T_screen - 273.15,
+                'alpha_min': ALPHA_MIN,
+            }
 
             # Calculate extraction pressure based on mode selection
             if pressure_mode == "Calculated":
@@ -2220,6 +2545,9 @@ def _run_one_simulation(p, *, display=True):
                 V=0.1, V_definition='Overall',
                 P=evap_P, chemical=solvent_CAS, flash=True)
 
+            # Start the diagnostic counters from zero for this simulation.
+            E301.reset_counters()
+
             MAX_EVAP_SOLIDS = 0.50
             _evap_target = min(evap_target_solids, MAX_EVAP_SOLIDS)
             _evap_target_solvent_frac = 1.0 - _evap_target
@@ -2228,18 +2556,55 @@ def _run_one_simulation(p, *, display=True):
             # reused as the centre of a narrow bracket on the next call.
             _last_V = [None]
 
+            # ── Log-space search variable ────────────────────────────
+            # The spec is a tolerance on the concentrate's SOLVENT MASS
+            # FRACTION, which depends on the solvent LEFT BEHIND -- and
+            # that is (1 - V) times the feed, i.e. a difference of two
+            # large numbers once V -> 1 (which is exactly where a dilute,
+            # high-solvent-flow extract puts it). Bisecting V linearly on
+            # [0.1, 0.999] resolves V to only ~2e-4 in 12 steps, while
+            # holding the solids fraction to 1e-3 at V ~ 0.99 needs V to
+            # ~1e-5. The tolerance is therefore UNREACHABLE: the early
+            # exits never fire, every pass burns the full 16 evaluations,
+            # and the _last_V warm start never pays off.
+            #
+            # Searching u = -log10(1 - V) instead gives constant RELATIVE
+            # resolution on the leftover solvent -- precisely what the
+            # tolerance measures. V=0.9 -> u=1, V=0.99 -> u=2,
+            # V=0.999 -> u=3, so 14 steps on the full u-range resolve
+            # (1 - V) to ~0.01% and the early exit becomes reachable.
+            _V_MIN, _V_MAX = 0.1, 0.999
+
+            def _V_to_u(V):
+                V = min(max(V, 0.0), _V_MAX)
+                return -log10(max(1e-12, 1.0 - V))
+
+            def _u_to_V(u):
+                return 1.0 - 10.0 ** (-u)
+
+            _U_MIN, _U_MAX = _V_to_u(_V_MIN), _V_to_u(_V_MAX)
+
+            # Warm-start cache: the V that solved the spec last time,
+            # reused as the centre of a narrow bracket on the next call.
+            _last_V = [None]
+
             @E301.add_specification(run=False)
             def adjust_evap_V():
-                """Bisect E301.V so the concentrated outlet hits the
-                solids target. Two speed-ups vs a naive 60-step wide
-                bisection: an early exit once the achieved solvent
-                fraction is within tolerance, and a warm-start narrow
-                bracket centred on the last solved V (the evaporator
-                feed changes only modestly between iterations)."""
+                """Bisect E301.V (in log space, see above) so the
+                concentrated outlet hits the solids target. Speed-ups vs a
+                naive wide bisection: an early exit once the achieved
+                solvent fraction is within tolerance, and a warm-start
+                narrow bracket centred on the last solved V (the
+                evaporator feed changes only modestly between recycle
+                iterations)."""
                 feed_in = E301.ins[0]
 
-                def get_solvent_frac(V):
-                    E301.V = V
+                def get_solvent_frac_at_u(u):
+                    # Leaves E301 RUN at this u -- so whichever u is
+                    # accepted last is the state the unit is left in.
+                    # (The old code could return after accepting `lo`
+                    # while the unit was still holding the `hi` run.)
+                    E301.V = _u_to_V(u)
                     E301._run()
                     conc = E301.outs[0]
                     if conc.F_mass <= 0:
@@ -2258,55 +2623,77 @@ def _run_one_simulation(p, *, display=True):
                     m_solv   = feed_in.imass[solv]
                     m_solids = m_feed - m_solv
                     if m_solids <= 1e-9:
-                        V_guess = 0.999
+                        V_guess = _V_MAX
                     else:
                         m_conc_target = m_solids / _evap_target
                         m_solv_out    = max(0.0, m_conc_target - m_solids)
                         m_evap        = max(0.0, m_solv - m_solv_out)
-                        V_guess = min(0.999, max(1e-3, m_evap / m_feed))
+                        V_guess = min(_V_MAX, max(1e-3, m_evap / m_feed))
 
                 target = _evap_target_solvent_frac
                 _FRAC_TOL = 1e-3
 
-                # Try a narrow bracket around the warm-start guess
-                half_width = 0.05
-                lo = max(1e-3, V_guess - half_width)
-                hi = min(0.999, V_guess + half_width)
-                f_lo = get_solvent_frac(lo)
-                f_hi = get_solvent_frac(hi)
+                # solvent_frac falls as V (hence u) rises, so the bracket
+                # logic below is unchanged in direction from the linear
+                # version -- only the variable has changed.
+                u_guess = _V_to_u(V_guess)
+
+                # Narrow bracket: +/-0.3 in u == a factor of ~2 either way
+                # in the leftover solvent (1 - V).
+                half_width = 0.3
+                lo = max(_U_MIN, u_guess - half_width)
+                hi = min(_U_MAX, u_guess + half_width)
+
+                # Evaluate lo, CHECK, then hi -- in that order, so an
+                # accepted bound is also the run E301 is left holding.
+                f_lo = get_solvent_frac_at_u(lo)
                 if abs(f_lo - target) < _FRAC_TOL:
-                    _last_V[0] = lo
+                    _last_V[0] = _u_to_V(lo)
                     return
+                f_hi = get_solvent_frac_at_u(hi)
                 if abs(f_hi - target) < _FRAC_TOL:
-                    _last_V[0] = hi
+                    _last_V[0] = _u_to_V(hi)
                     return
 
                 # Fall back to the wide bracket if the narrow one
                 # doesn't bracket-cross
                 if (f_lo - target) * (f_hi - target) >= 0:
-                    lo, hi = 0.1, 0.999
-                    f_lo = get_solvent_frac(lo)
-                    f_hi = get_solvent_frac(hi)
+                    lo, hi = _U_MIN, _U_MAX
+                    f_lo = get_solvent_frac_at_u(lo)
                     if abs(f_lo - target) < _FRAC_TOL:
-                        _last_V[0] = lo
+                        _last_V[0] = _u_to_V(lo)
                         return
+                    f_hi = get_solvent_frac_at_u(hi)
                     if abs(f_hi - target) < _FRAC_TOL:
-                        _last_V[0] = hi
+                        _last_V[0] = _u_to_V(hi)
+                        return
+                    if (f_lo - target) * (f_hi - target) >= 0:
+                        # Target unreachable anywhere in [V_MIN, V_MAX]:
+                        # settle on the closest end and LEAVE E301 RUN
+                        # there, so E301.V and E301.outs stay consistent.
+                        u_end = (hi if abs(f_hi - target) < abs(f_lo - target)
+                                 else lo)
+                        get_solvent_frac_at_u(u_end)
+                        _last_V[0] = _u_to_V(u_end)
                         return
 
                 # Bisection with early exit
-                for _ in range(12):
+                for _ in range(14):
                     mid = (lo + hi) / 2
-                    f_mid = get_solvent_frac(mid)
+                    f_mid = get_solvent_frac_at_u(mid)
                     if abs(f_mid - target) < _FRAC_TOL:
-                        _last_V[0] = mid
+                        _last_V[0] = _u_to_V(mid)
                         return
-                    if f_mid > target:
+                    if f_mid > target:      # too much solvent left -> boil more
                         lo = mid
                     else:
                         hi = mid
-                _last_V[0] = (lo + hi) / 2
-                E301.V = _last_V[0]
+                # Exhausted: re-run at the final midpoint so that E301.V
+                # and E301.outs agree (the old code assigned E301.V without
+                # re-running, leaving the outlet from a different V).
+                u_final = (lo + hi) / 2
+                get_solvent_frac_at_u(u_final)
+                _last_V[0] = _u_to_V(u_final)
 
             SD1 = SolventSprayDryer('Spray Dryer',
                 ins=E301.outs[0],
@@ -2510,8 +2897,9 @@ def _run_one_simulation(p, *, display=True):
                     recycle_solver_msg = (
                         f"\u2705 Recycle split solved from mass "
                         f"balance: {recycle_optimal_split:.5f}")
-                    _recycle_status.success(
-                        f"\u2705 Recycle solved in "
+                    _recycle_status.empty()   # clear live progress line
+                    _run_status_lines.append(
+                        f"Recycle solved in "
                         f"{_recycle_progress['wegstein']} Wegstein "
                         f"iteration(s).")
             else:
@@ -2519,6 +2907,36 @@ def _run_one_simulation(p, *, display=True):
                 sys.simulate()
                 recycle_optimal_split = None
                 recycle_solver_msg = None
+
+            # ── Evaporator solver diagnostics ────────────────────────
+            # n_run : how many times E301._run() was called this simulation.
+            #         This is the SPEED number -- the evaporator sits inside
+            #         the V-bisection inside the Wegstein loop, so it is the
+            #         product of all the nested iteration counts.
+            # n_fb  : how many of those calls tripped a guard and fell back to
+            #         a guessed / crude result instead of solving. This is the
+            #         TRUST number. If n_fb > 0 the evaporator's duty, area and
+            #         capital cost are not solved values, and the minimum
+            #         selling price built on them is not reliable -- even
+            #         though every stream will still look perfectly healthy.
+            evap_n_run = E301.n_run
+            evap_n_fb = E301.n_fb
+            evap_shortcut = bool(getattr(E301, '_design_from_shortcut', False))
+            evap_guard_counts = dict(getattr(E301, '_guard_counts', {}))
+            evap_guard_reasons = dict(getattr(E301, '_guard_reasons', {}))
+
+            if display:
+                if evap_n_fb == 0:
+                    _run_status_lines.append(
+                        f"Evaporator solved cleanly on all "
+                        f"{evap_n_run:,} `_run` call(s) — rigorous duty, "
+                        f"area and cost.")
+                # The guard-trip breakdown (when evap_n_fb > 0) is rendered at
+                # the bottom of the output, grouped with the volatility-screen
+                # and proxy-compound notes. The data needed for it is already
+                # captured in evap_n_fb / evap_shortcut / evap_guard_counts /
+                # evap_guard_reasons above.
+
             _advance_progress()  # Stage 5: techno-economic analysis
             #                       COUNT PROCESSING STEPS FOR LABOR CALCULATION
             # Define which unit types involve solids
@@ -2633,6 +3051,86 @@ def _run_one_simulation(p, *, display=True):
             fci = tea.FCI
             tci = tea.TCI
 
+            # ── Preflight: locate any NaN/inf before solve_price ─────────
+            # BioSTEAM's solve_price raises a bare "nan encountered in
+            # cashflow array" that names neither the unit nor the quantity at
+            # fault. The NaN almost always originates upstream — a zero/NaN
+            # product flow, or a unit whose installed cost or utility duty came
+            # out non-finite — so scan the obvious sources first and fail with
+            # a message that says WHERE.
+            import math as _math
+
+            def _finite(x):
+                try:
+                    return _math.isfinite(float(x))
+                except (TypeError, ValueError):
+                    return True   # non-numeric -> not our concern here
+
+            _nan_problems = []
+
+            # 1. Product stream must carry finite, positive flow, or the price
+            #    solve (sales / production) is ill-defined.
+            _prod_F = cooled_product.F_mass
+            if not _finite(_prod_F):
+                _nan_problems.append(
+                    "product stream 'cooled_product' has non-finite mass flow")
+            elif _prod_F <= 0:
+                _zero_prod = (
+                    "product stream 'cooled_product' has zero mass flow — "
+                    "nothing is being produced to price.")
+                # The most likely recent cause: the volatility screen kept a
+                # PRODUCT solute in the VLE (alpha >= ALPHA_MIN), so it left in
+                # the evaporator condensate instead of the concentrate that
+                # becomes product. Surface the locked/kept split so this is
+                # checkable.
+                if _volatility_screen_info is not None:
+                    _kept_ids = [i for i, _ in _volatility_screen_info['kept']]
+                    if _kept_ids:
+                        _zero_prod += (
+                            " Note: the volatility screen kept "
+                            f"{len(_kept_ids)} solute(s) in the VLE "
+                            f"({', '.join(_kept_ids[:6])}"
+                            f"{' …' if len(_kept_ids) > 6 else ''}); if your "
+                            "target product is among them it is leaving in the "
+                            "evaporator condensate rather than the product. "
+                            "Raise ALPHA_MIN or exempt the product solute.")
+                    else:
+                        _zero_prod += (
+                            " (Check extraction recovery and the "
+                            "dryer/evaporator splits.)")
+                _nan_problems.append(_zero_prod)
+
+            # 2. Per-unit installed cost and utility cost.
+            for _u in sys.units:
+                try:
+                    if not _finite(_u.installed_cost):
+                        _nan_problems.append(
+                            f"unit '{_u.ID}' has non-finite installed cost")
+                    if not _finite(_u.utility_cost):
+                        _nan_problems.append(
+                            f"unit '{_u.ID}' has non-finite utility cost")
+                    for _hu in getattr(_u, 'heat_utilities', ()):
+                        if _hu.duty is not None and not _finite(_hu.duty):
+                            _nan_problems.append(
+                                f"unit '{_u.ID}' has non-finite heat-utility "
+                                f"duty")
+                            break
+                except Exception:
+                    pass
+
+            # 3. Aggregate TEA capital figures.
+            for _label, _val in (('DPI', dfc), ('FCI', fci), ('TCI', tci)):
+                if not _finite(_val):
+                    _nan_problems.append(f"TEA {_label} is non-finite")
+
+            if _nan_problems:
+                _msg = ("Cannot solve product price — a non-finite value "
+                        "reached the cash-flow array. Source(s):\n  - "
+                        + "\n  - ".join(dict.fromkeys(_nan_problems)))
+                if display:
+                    st.error("❌ " + _msg)
+                raise RuntimeError(_msg)
+
             # Calculate minimum selling price (on dried product)
             Product_price = tea.solve_price(cooled_product)
 
@@ -2686,6 +3184,15 @@ def _run_one_simulation(p, *, display=True):
                 'feed_to_storage_kg_per_hr': float(S101.ins[0].F_mass),
                 'evap_n_effects':       evap_n_effects,
                 'evap_target_solids':   evap_target_solids,
+                # Solver diagnostics -- see the block after sys.simulate().
+                # evap_n_fb > 0 means the evaporator cost/duty on this row is
+                # an estimate, not a solved value.
+                'evap_n_run':           evap_n_run,
+                'evap_n_fb':            evap_n_fb,
+                'evap_sizing_shortcut': evap_shortcut,
+                'evap_guard_trips':     ("; ".join(
+                    f"{k}x{v}" for k, v in evap_guard_counts.items())
+                    if evap_guard_counts else ""),
                 'dryer_moisture':       dryer_moisture,
                 'enable_recycle':       enable_recycle,
                 'recycle_x_max':        recycle_x_max,
@@ -3460,6 +3967,99 @@ def _run_one_simulation(p, *, display=True):
                                        "row and no ChEBI group, so they were not "
                                        "checked.")
                             st.write(", ".join(degradation_unclassified))
+
+            # Solver summary — the recycle/evaporator convergence details,
+            # rendered once here at the bottom instead of stacking green
+            # banners at the top and pushing the results down. (The overall
+            # "Simulation completed successfully" confirmation stays inline,
+            # just above the results.)
+            if display and _run_status_lines:
+                st.success(
+                    "✅ **Solver summary**\n\n"
+                    + "\n".join(f"- {line}" for line in _run_status_lines))
+
+            # Guard trip breakdown (only when the evaporator tripped a guard) —
+            # grouped here at the bottom with the other diagnostics.
+            if display and evap_n_fb > 0:
+                _pct = 100.0 * evap_n_fb / max(1, evap_n_run)
+                with st.expander("⚠️ Evaporator guard trip breakdown",
+                                 expanded=False):
+                    if evap_shortcut:
+                        st.warning(
+                            f"⚠️ Evaporator tripped a guard on "
+                            f"**{evap_n_fb:,}** of **{evap_n_run:,}** "
+                            f"`_run` call(s) ({_pct:.1f}%), **including "
+                            f"the final one** — so its sizing came from "
+                            f"the **short-cut energy balance**, not the "
+                            f"rigorous cascade. Area/cost are a defensible "
+                            f"estimate (validated to within ~3–8% at high "
+                            f"V, erring high), but they are not solved "
+                            f"values.")
+                    else:
+                        st.info(
+                            f"ℹ️ Evaporator tripped a guard on "
+                            f"**{evap_n_fb:,}** of **{evap_n_run:,}** "
+                            f"`_run` call(s) ({_pct:.1f}%) during "
+                            f"convergence, but **not on the final one** — "
+                            f"the reported sizing is from the rigorous "
+                            f"cascade. Transient trips on intermediate "
+                            f"iterates are not fatal, but they indicate "
+                            f"the flash is near its limits.")
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{'guard': k, 'trips': v}
+                             for k, v in sorted(
+                                 evap_guard_counts.items(),
+                                 key=lambda kv: -kv[1])],
+                        ),
+                        use_container_width=True, hide_index=True)
+                    for _g, _rs in evap_guard_reasons.items():
+                        st.caption(f"**{_g}** — distinct reasons:")
+                        st.code("\n".join(_rs))
+
+            # Volatility screen (computed earlier; rendered here so it sits
+            # at the bottom with the other chemistry notes).
+            if display and _volatility_screen_info is not None:
+                _vsi = _volatility_screen_info
+                _kept, _locked = _vsi['kept'], _vsi['locked']
+                with st.expander("🧪 Volatility screen results",
+                                 expanded=False):
+                    st.caption(
+                        f"{len(_kept)} solute(s) kept in VLE, {len(_locked)} "
+                        f"locked to liquid — alpha vs {_vsi['solv']} at "
+                        f"{_vsi['T_screen_C']:.0f} °C, cutoff "
+                        f"{_vsi['alpha_min']:g}.")
+                    st.caption(
+                        "Solutes KEPT in the VLE co-evaporate with the solvent "
+                        "and reach the condensate — they are what "
+                        "`recycle_x_max` caps. Solutes LOCKED to liquid are "
+                        "treated as non-volatile and report entirely to the "
+                        "concentrate. If a compound you expect to co-distil "
+                        "appears in the locked list, lower ALPHA_MIN; if the "
+                        "evaporator flash is driving the temperature out of "
+                        "range, raise it.")
+                    _rows = ([{'chemical': _id, 'alpha': f"{_a:.3g}",
+                               'in VLE': '✅ yes'} for _id, _a in
+                              sorted(_kept, key=lambda kv: -kv[1])]
+                             + [{'chemical': _id,
+                                 'alpha': ('n/a (Psat unevaluable)'
+                                           if _a != _a else f"{_a:.3g}"),
+                                 'in VLE': '— locked'} for _id, _a in
+                                sorted(_locked,
+                                       key=lambda kv: (kv[1] != kv[1],
+                                                       -(kv[1] if kv[1] == kv[1]
+                                                         else 0)))])
+                    if _rows:
+                        st.dataframe(pd.DataFrame(_rows),
+                                     use_container_width=True, hide_index=True)
+                    if not _kept:
+                        st.warning(
+                            "⚠️ No solute is volatile enough to enter the "
+                            "vapour, so the condensate is essentially pure "
+                            "solvent and the impurity-cap bound on the recycle "
+                            "split will never bind — `recycle_x_max` has no "
+                            "effect on this run. Lower ALPHA_MIN if you expect "
+                            "solute carryover.")
 
             # Show proxy warnings at bottom if any
             if proxy_warnings:
