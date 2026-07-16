@@ -10,6 +10,7 @@ from thermosteam import Chemical, MultiStream, separations
 from biosteam import units
 from biosteam.units.decorators import cost
 from math import exp, log, log10
+import math as _math
 import flexsolve as flx
 import numpy as np
 from scipy.optimize import brentq
@@ -121,13 +122,84 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
         solution. That is how a guard trip produced a complete, plausible, and
         meaningless capital cost.
 
-        So: if the cascade solved, use BioSTEAM's rigorous design, unchanged.
-        If a guard fired, discard the cascade state and size from an explicit
-        energy balance instead (see _design_from_energy_balance).
+        So: if the cascade solved AND the resulting design is physically
+        sane, use BioSTEAM's rigorous design, unchanged. If a guard fired,
+        OR the rigorous design produced something non-finite / negative
+        (which can happen with no exception at all -- see below), discard
+        the cascade state and size from an explicit energy balance instead.
+
+        The second condition exists because a guard trip is not the only way
+        the cascade can go wrong. At extreme V (near-total vaporization,
+        which is what a very high recycle cap pushes the evaporator toward),
+        IQ_interpolation can converge -- no exception, _flash_fallback_used
+        stays False -- while still landing on a per-effect duty split that is
+        physically degenerate: one effect gets assigned a NEGATIVE area.
+        BioSTEAM's own cost correlation does log(A * 0.0929), which is
+        undefined for negative A, so this produces a silent NaN that nothing
+        upstream flagged as a failure:
+            CostWarning: heat transfer area requirement (-0.207 ft2) ...
+            RuntimeWarning: invalid value encountered in log
+        So the rigorous path's OUTPUT is validated, not just whether it threw.
         """
         if not getattr(self, '_flash_fallback_used', False):
             self._design_from_shortcut = False
-            return super()._design()
+            super()._design()
+
+            # A single effect can come back with a negative / non-finite area
+            # (e.g. -0.207 ft2 from a slight temperature inversion in a
+            # lightly-loaded effect near total vaporization). BioSTEAM's cost
+            # correlation does log(A), so that one effect poisons the whole
+            # evaporator cost with NaN. The other effects are usually fine.
+            #
+            # Rather than discard the entire rigorous cascade, zero out ONLY
+            # the degenerate effect(s) — an effect with an inverted/near-zero
+            # driving force carries no useful duty, so contributing 0 area and
+            # 0 cost is the right accounting — and keep every healthy effect's
+            # rigorous sizing. This is what BioSTEAM already does for effects
+            # with Q <= 1e-12; it just misses the negative-LMTD case. No
+            # re-simulation: this only rewrites the per-effect area/cost lists.
+            _As = getattr(self, '_As', None)
+            _costs = getattr(self, '_evap_costs', None)
+            _zeroed = []
+            if _As is not None and _costs is not None:
+                for _i in range(len(_As)):
+                    _a = _As[_i]
+                    _c = _costs[_i] if _i < len(_costs) else 0.0
+                    if (not _math.isfinite(_a) or _a < 0
+                            or not _math.isfinite(_c) or _c < 0):
+                        _zeroed.append(_i)
+                        _As[_i] = 0.0
+                        if _i < len(_costs):
+                            _costs[_i] = 0.0
+                if _zeroed:
+                    self._As = _As
+                    self._evap_costs = _costs
+                    self.design_results['Area'] = sum(_As)
+                    self.baseline_purchase_costs['Evaporators'] = sum(_costs)
+                    self._degenerate_effects = _zeroed
+                    self._note_guard(
+                        'degenerate effect zeroed (negative/non-finite area)',
+                        ValueError(f"effects {_zeroed} of {len(_As)} zeroed; "
+                                   f"As now {[round(a, 3) for a in _As]}"))
+
+            # Safety net: if EVERY effect was degenerate (nothing left to
+            # cost), or the totals are still non-finite for any other reason,
+            # fall back to the bounded equal-split energy-balance design.
+            _area = self.design_results.get('Area', None)
+            _cost = self.baseline_purchase_costs.get('Evaporators', None)
+            _all_zero = _As is not None and len(_zeroed) == len(_As)
+            if (_all_zero
+                    or (_area is not None
+                        and (not _math.isfinite(_area) or _area < 0))
+                    or (_cost is not None
+                        and (not _math.isfinite(_cost) or _cost < 0))):
+                self._note_guard(
+                    'rigorous design unusable -> energy-balance shortcut',
+                    ValueError(f"Area={_area}, Cost={_cost}"))
+                self._flash_fallback_used = True
+                self._design_from_shortcut = True
+                self._design_from_energy_balance()
+            return
         self._design_from_shortcut = True
         self._design_from_energy_balance()
 
@@ -212,17 +284,43 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
             Th = T_eff[0] + 20.0
 
         # 5. Areas and costs -- same correlation as the rigorous path.
+        #    Validated at each step: this is the path that is SUPPOSED to be
+        #    the safety net, so it must not itself be able to emit a NaN. If
+        #    a duty or LMTD comes out non-finite (e.g. Hvap undefined this
+        #    close to Tc for some solvent/pressure combination), fail loudly
+        #    here rather than silently handing a NaN to the TEA.
         As, evap_costs = [], []
         bounds_warning = bst.exceptions.bounds_warning
         for i, T in enumerate(T_eff):
             Qi = Q1 if i == 0 else Q_lat[i]
             T_hot = Th if i == 0 else T_eff[i - 1]
             LMTD = max(T_hot - T, 1.0)    # isothermal both sides -> LMTD = dT
+            if not (_math.isfinite(Qi) and Qi >= 0 and _math.isfinite(LMTD)):
+                raise RuntimeError(
+                    f"CorrectedMEE energy-balance sizing produced a "
+                    f"non-finite/negative duty on effect {i + 1} "
+                    f"(Q={Qi}, LMTD={LMTD}, T_eff={T_eff}, P={P_list}). "
+                    f"This is the sizing fallback itself failing; the "
+                    f"pressures or solvent/temperature combination need "
+                    f"checking directly.")
             A = abs(_ht.compute_heat_transfer_area(LMTD, U, Qi, 1.))
+            if not _math.isfinite(A):
+                raise RuntimeError(
+                    f"CorrectedMEE energy-balance sizing produced a "
+                    f"non-finite area on effect {i + 1} (Q={Qi}, LMTD={LMTD}).")
             As.append(A)
             bounds_warning(self, 'heat transfer area requirement', A, 'ft2',
                            A_range, 'cost')
-            evap_costs.append(C_func(A, CE))
+            _c = C_func(A, CE)
+            if not _math.isfinite(_c):
+                raise RuntimeError(
+                    f"CorrectedMEE energy-balance sizing: cost correlation "
+                    f"returned non-finite for effect {i + 1} (A={A:.4g} ft2, "
+                    f"outside its valid range {A_range}). Area is far enough "
+                    f"outside the correlation's fitted range that the "
+                    f"polynomial itself blows up; check flow scale / N "
+                    f"effects for this case.")
+            evap_costs.append(_c)
 
         self._As = As
         self._evap_costs = evap_costs
@@ -2738,8 +2836,26 @@ def _run_one_simulation(p, *, display=True):
                 # iterations the fresh solvent stream is never empty -
                 # SolidSolventExtractor checks the union of feeds for the
                 # solvent and raises if both are < 1e-10 mol.
-                _makeup_floor   = 1.0    # kg/hr
-                _MIN_PURGE_FRAC = 0.01   # always purge >=1%
+                # Purge floor. This caps S1.split at (1 - _MIN_PURGE_FRAC),
+                # i.e. limits recycle to 99.9%. It is a SOLVER guard, not a
+                # process requirement: as the split -> 1 the fresh makeup -> 0
+                # and the recycle becomes nearly the entire solvent feed, so
+                # the loop gain approaches unity and Wegstein can get stiff
+                # near the singular point. A small floor keeps a guaranteed
+                # exit so the loop never reaches split == 1 exactly.
+                #
+                # It was previously 0.01 (99% cap) because, when the split was
+                # found by a root-search, the search stalled near the upper
+                # limit at high flows. That search has since been replaced by
+                # the direct mass balance below (adjust_recycle_split solves
+                # the split in one shot per pass, no root-find), so the floor
+                # can be relaxed to 0.001 (99.9% cap) to allow higher recycle
+                # at large flows. If convergence degrades near the limit, the
+                # Wegstein count in the solver summary will show it; raise this
+                # back toward 0.01 if so.
+                _makeup_floor   = 1.0     # kg/hr fresh solvent (negligible at
+                #                           large flows; not the binding limit)
+                _MIN_PURGE_FRAC = 0.001   # always purge >= 0.1% (recycle <= 99.9%)
 
                 # Live progress for the recycle solve (Wegstein count).
                 _recycle_progress = {'wegstein': 0}
