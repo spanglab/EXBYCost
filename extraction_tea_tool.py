@@ -2544,14 +2544,31 @@ def _run_one_simulation(p, *, display=True):
             cooled_product = bst.Stream('cooled_product')  # cooled dried product
 
             # ── Recycle-loop streams (used only when enable_recycle=True) ──
-            # `recycle` is a tear stream — its initial flow is just an
-            # initial guess for the iterative solver. The Wegstein method
-            # converges the loop, then the outer brentq loop sizes the
-            # purge to satisfy the impurity cap.
+            # `recycle` is a tear stream — its initial flow is only a
+            # starting guess for the Wegstein solver, which then converges
+            # the loop. The split is NOT searched for: adjust_recycle_split
+            # recomputes it from a mass balance on every pass, so this guess
+            # affects only how fast the loop converges, never the answer.
+            #
+            # Warm start: with the feed dryer on, almost no feed moisture
+            # reaches the loop, the impurity cap rarely binds, and the
+            # recycle converges near its makeup-floor maximum (~solvflow).
+            # Seeding the tear near that maximum (and near-dry) starts
+            # Wegstein close to the answer and saves passes. With the dryer
+            # off, more water enters, the cap is more likely to bind, and
+            # the converged recycle sits lower — so the original modest
+            # guess is the better starting point there.
             if enable_recycle:
+                # Dryer-gated warm start (see note above).
+                if feed_dry_enable:
+                    _seed_solv  = 0.95 * solvflow   # dryer → recycle pinned near max
+                    _seed_water = 0.0               # feed moisture stripped upstream
+                else:
+                    _seed_solv  = 0.2 * solvflow    # wetter feed → cap may bind, recycle lower
+                    _seed_water = 0.01 * solvflow
                 recycle = bst.Stream('recycle',
-                                     **{solv: 0.2 * solvflow,
-                                        'Water': 0.01 * solvflow},
+                                     **{solv: _seed_solv,
+                                        'Water': _seed_water},
                                      units='kg/hr')
                 purge = bst.Stream('purge')
                 condensed_dryer_vapor = bst.Stream('condensed_dryer_vapor')
