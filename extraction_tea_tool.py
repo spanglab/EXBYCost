@@ -2986,6 +2986,121 @@ def _run_one_simulation(p, *, display=True):
             # Create system (auto-detects the recycle loop)
             sys = bst.System.from_units('sys', bst.main_flowsheet.unit)
 
+            # ── Mixture-based first-effect sizing ─────────────────────
+            # suggest_pressures() places effect 1 using the PURE solvent
+            # Psat curve, but the flash inside the evaporator solves the
+            # real multicomponent VLE. Water carried in from the feed
+            # depresses the extract bubble point below the pure-solvent
+            # value (heteroazeotrope), so the effect can end up boiling
+            # BELOW the feed, which BioSTEAM rejects with
+            #     ValueError: inlet must be cooler than outlet if heating
+            # These helpers raise P[0] until the mixture boils above the
+            # feed. They ONLY ever raise it -- a feed already cooler than
+            # the mixture boiling point is left alone, so runs that never
+            # had the problem are bit-for-bit unaffected.
+            def _evap_apply_P(P_new):
+                """Rebuild the cascade around a new first-effect pressure.
+
+                Returns True if the pressure was actually changed.
+                """
+                nonlocal evap_P     # the thermal-degradation flags read
+                                    # max(evap_P), not E301.P -- keep the
+                                    # two in step
+                import math as _m   # `_math` is rebound as a function-local
+                                    # further down; do not close over it
+                if not _m.isfinite(P_new) or P_new <= 0:
+                    return False
+                if P_new <= float(E301.P[0]):
+                    return False
+                try:
+                    _chem = tmo.settings.chemicals[solv]
+                    _T_high_C = float(_chem.Tsat(P_new)) - 273.15
+                    _P_tuple = suggest_pressures(
+                        solv, n_effects=evap_n_effects,
+                        delta_T_C=20, T_high_C=_T_high_C)
+                except Exception:
+                    return False
+                E301.P = _P_tuple
+                evap_P = _P_tuple
+                E301._reload_components = True
+                return True
+
+            def _resize_evap_measured(margin_K):
+                """Resize using the depression the flash ACTUALLY produced.
+
+                The first effect has already run, so both the pure-solvent
+                saturation temperature at P[0] and the temperature the real
+                mixture chose are known. Their difference is the bubble-point
+                depression, measured rather than predicted. Shifting the
+                pure-basis target up by that same amount lands the mixture
+                where it needs to be, using only the pure-component Psat and
+                Tsat curves -- no separate VLE call that could disagree with
+                the flash.
+                """
+                import math as _m
+                try:
+                    _chem = tmo.settings.chemicals[solv]
+                    _T_feed = float(E301.ins[0].T)
+                    _T_eff = float(E301.evaporators[0].outs[0].T)
+                    _depr = float(_chem.Tsat(E301.P[0])) - _T_eff
+                except Exception:
+                    return False
+                if not _m.isfinite(_depr) or _depr < 0.0 or _depr > 60.0:
+                    return False
+                try:
+                    _P_new = float(_chem.Psat(_T_feed + margin_K + _depr))
+                except Exception:
+                    return False
+                return _evap_apply_P(_P_new)
+
+            def _resize_evap_bubble(margin_K):
+                """Resize from the mixture bubble point (pre-solve path).
+
+                Used before the first simulation, when there is no flash
+                result to measure yet.
+                """
+                try:
+                    _s = E301.ins[0]
+                    if float(_s.F_mol) <= 0:
+                        return False       # stream not primed yet
+                    _P_new = float(
+                        _s.bubble_point_at_T(T=float(_s.T) + margin_K).P)
+                except Exception:
+                    return False
+                return _evap_apply_P(_P_new)
+
+            def _simulate_with_evap_retry():
+                """sys.simulate(), raising P[0] if the feed self-flashes.
+
+                On a pinch failure the depression is measured from the
+                converged flash and P[0] is raised by exactly that much plus
+                the margin -- never more. Falls back to the bubble point if
+                the flash state cannot be read. Any other ValueError, and the
+                pinch error once the margins are exhausted, propagate
+                unchanged.
+                """
+                _margins = (3.0, 6.0, 10.0)
+                for _i in range(len(_margins) + 1):
+                    try:
+                        sys.simulate()
+                        return
+                    except ValueError as _e:
+                        if "inlet must be cooler" not in str(_e):
+                            raise
+                        if _i >= len(_margins):
+                            raise
+                        if not (_resize_evap_measured(_margins[_i])
+                                or _resize_evap_bubble(_margins[_i])):
+                            raise
+
+            # Pre-size effect 1 off the primed extract before the first solve.
+            # No-op when the stream is empty (no-recycle branch) or when the
+            # feed is already cooler than the mixture boiling point.
+            try:
+                _resize_evap_bubble(3.0)
+            except Exception:
+                pass
+
             if enable_recycle:
                 # With the recycle split derived from a mass balance
                 # (adjust_recycle_split), the loop has a single physical
@@ -3000,7 +3115,7 @@ def _run_one_simulation(p, *, display=True):
                 _recycle_spinner = (st.spinner("Solving recycle loop ...")
                                     if display else contextlib.nullcontext())
                 with _recycle_spinner:
-                    sys.simulate()
+                    _simulate_with_evap_retry()
 
                     # Post-simulation sanity check. Hard physical ceiling
                     # on the recycle mixer M2 = recycle + purge:
@@ -3037,7 +3152,7 @@ def _run_one_simulation(p, *, display=True):
                         f"iteration(s).")
             else:
                 _advance_progress()  # Stage 4 (no recycle): single solve
-                sys.simulate()
+                _simulate_with_evap_retry()
                 recycle_optimal_split = None
                 recycle_solver_msg = None
 
