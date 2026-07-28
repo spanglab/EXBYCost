@@ -107,6 +107,62 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
         """Total guard trips since the last reset_counters() (all guards)."""
         return sum(getattr(self, '_guard_counts', {}).values())
 
+    # ---- Cascade trust check -----------------------------------------------
+    # Relative tolerance on the first-effect mass balance. Genuine solver
+    # residuals sit many orders below this; the failure it catches is total
+    # (98%+ of the feed unaccounted for), so the exact value is not delicate.
+    _CASCADE_MASS_TOL = 1e-3
+
+    def _cascade_mass_error(self):
+        """Relative mass imbalance across the FIRST effect, or None.
+
+        BioSTEAM aliases streams when the cascade holds a single effect:
+
+            Flash(ins=self.ins,
+                  outs=(None, self.outs[0] if n == 1 else None), P=P[0])
+
+        so with n == 1, `evaporators[0].outs[1]` IS `self.outs[0]`. The
+        corrected flash=True block at the end of _run then does
+
+            out_wt_solids.mol = mixed_stream.imol['l']
+
+        which rewrites that same object -- replacing the flash's own outlet
+        while its inlet is untouched. _design afterwards computes
+
+            duty = first_evaporator.H_out - first_evaporator.H_in
+
+        across streams that no longer describe one unit, so `duty` becomes
+        roughly minus the enthalpy of the missing mass. Its SIGN then decides
+        which half of BioSTEAM's pinch check applies, and the result is a
+        "must be hotter/cooler" ValueError that no pressure change can fix,
+        because the temperatures were never the problem.
+
+        n == 1 arises on its own: _run pops effects while
+
+            self._V_overall(0.) > self.V
+
+        and can strip a 3-effect cascade down to 1. Note it then restores the
+        original pressure tuple, so `self.P` and `self.evaporators` disagree
+        in length afterwards -- which is why the message below reports both.
+
+        With 2+ effects `evaporators[0].outs[1]` is a private internal stream
+        and nothing overwrites it, so this returns ~0 and costs nothing.
+        """
+        try:
+            evaps = getattr(self, 'evaporators', None)
+            if not evaps:
+                return None
+            first = evaps[0]
+            m_in = sum(float(s.F_mass) for s in first.ins)
+            if not _math.isfinite(m_in) or m_in <= 1e-9:
+                return None
+            m_out = sum(float(s.F_mass) for s in first.outs)
+            if not _math.isfinite(m_out):
+                return None
+            return abs(m_in - m_out) / m_in
+        except Exception:
+            return None
+
     # ---- Design ------------------------------------------------------------
     def _design(self):
         """Size the evaporator.
@@ -141,6 +197,32 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
             RuntimeWarning: invalid value encountered in log
         So the rigorous path's OUTPUT is validated, not just whether it threw.
         """
+        # The cascade objects must at least conserve mass before anything is
+        # read off them. When they do not, the rigorous path would return a
+        # complete and entirely meaningless design (see _cascade_mass_error),
+        # so take the same shortcut used for a crashed cascade.
+        _mass_err = self._cascade_mass_error()
+        if (_mass_err is not None
+                and _mass_err > self._CASCADE_MASS_TOL):
+            try:
+                _n_live = len(self.evaporators)
+                _n_spec = len(self.P)
+                _m_in = sum(float(s.F_mass) for s in self.evaporators[0].ins)
+                _m_out = sum(float(s.F_mass) for s in self.evaporators[0].outs)
+                _detail = (f"first-effect mass error {_mass_err:.4%} "
+                           f"(in {_m_in:,.2f} kg/hr, out {_m_out:,.2f} kg/hr); "
+                           f"{_n_live} effect(s) live vs {_n_spec} pressure(s) "
+                           f"specified")
+            except Exception:
+                _detail = f"first-effect mass error {_mass_err:.4%}"
+            self._note_guard(
+                'cascade mass imbalance -> energy-balance shortcut',
+                ValueError(_detail))
+            self._flash_fallback_used = True
+            self._design_from_shortcut = True
+            self._design_from_energy_balance()
+            return
+
         if not getattr(self, '_flash_fallback_used', False):
             self._design_from_shortcut = False
             super()._design()
@@ -2987,31 +3069,56 @@ def _run_one_simulation(p, *, display=True):
             sys = bst.System.from_units('sys', bst.main_flowsheet.unit)
 
             # ── Mixture-based first-effect sizing ─────────────────────
-            # suggest_pressures() places effect 1 using the PURE solvent
-            # Psat curve, but the flash inside the evaporator solves the
-            # real multicomponent VLE. Water carried in from the feed
-            # depresses the extract bubble point below the pure-solvent
-            # value (heteroazeotrope), so the effect can end up boiling
-            # BELOW the feed, which BioSTEAM rejects with
-            #     ValueError: inlet must be cooler than outlet if heating
-            # These helpers raise P[0] until the mixture boils above the
-            # feed. They ONLY ever raise it -- a feed already cooler than
-            # the mixture boiling point is left alone, so runs that never
-            # had the problem are bit-for-bit unaffected.
-            def _evap_apply_P(P_new):
+            # BioSTEAM books the first effect's utility with
+            #     hu(duty, Tci, Tco)      Tci = feed T, Tco = effect-1 T
+            # and rejects two of the four sign combinations:
+            #
+            #                     Tci > Tco          Tci < Tco
+            #   duty > 0   "must be cooler" ERR         ok
+            #   duty < 0          ok            "must be hotter" ERR
+            #
+            # suggest_pressures() places effect 1 on the PURE solvent Psat
+            # curve, but the flash solves the real multicomponent VLE. Water
+            # from the feed depresses the extract bubble point below the
+            # pure-solvent value (heteroazeotrope), so Tco lands well below
+            # where the pure-basis numbers implied and the feed can end up on
+            # the wrong side of it.
+            #
+            # The correction is the same in both cases -- move Tco to the
+            # side of the feed that the duty sign requires -- but the
+            # DIRECTION of the pressure change is opposite, so a case sitting
+            # near duty == 0 could ping-pong between the two errors. Every
+            # pressure tried is recorded and never revisited, which turns an
+            # oscillation into a clean raise of the original error.
+            _evap_tried_P = set()
+
+            # Diagnose-only for the cooling-side pinch failure: dump the
+            # first-effect state and re-raise, rather than applying a
+            # correction whose direction is opposite to the heating one.
+            # Flip to True once the duty magnitude confirms the direction.
+            _EVAP_AUTOFIX_COOLING = False
+
+            def _evap_apply_P(P_new, allow_lower=False):
                 """Rebuild the cascade around a new first-effect pressure.
 
-                Returns True if the pressure was actually changed.
+                Raises P[0] by default. `allow_lower` inverts that, for the
+                cooling-side correction. Returns True if P was changed.
                 """
                 nonlocal evap_P     # the thermal-degradation flags read
                                     # max(evap_P), not E301.P -- keep the
                                     # two in step
                 import math as _m   # `_math` is rebound as a function-local
                                     # further down; do not close over it
-                if not _m.isfinite(P_new) or P_new <= 0:
+                if not _m.isfinite(P_new) or P_new <= 100.0:
                     return False
-                if P_new <= float(E301.P[0]):
+                _P_cur = float(E301.P[0])
+                if allow_lower:
+                    if P_new >= _P_cur:
+                        return False
+                elif P_new <= _P_cur:
                     return False
+                if round(P_new, -1) in _evap_tried_P:
+                    return False    # already been here -- do not oscillate
                 try:
                     _chem = tmo.settings.chemicals[solv]
                     _T_high_C = float(_chem.Tsat(P_new)) - 273.15
@@ -3023,19 +3130,25 @@ def _run_one_simulation(p, *, display=True):
                 E301.P = _P_tuple
                 evap_P = _P_tuple
                 E301._reload_components = True
+                _evap_tried_P.add(round(P_new, -1))
+                _evap_tried_P.add(round(float(E301.P[0]), -1))
                 return True
 
-            def _resize_evap_measured(margin_K):
+            def _resize_evap_measured(margin_K, cooling=False):
                 """Resize using the depression the flash ACTUALLY produced.
 
                 The first effect has already run, so both the pure-solvent
                 saturation temperature at P[0] and the temperature the real
                 mixture chose are known. Their difference is the bubble-point
-                depression, measured rather than predicted. Shifting the
-                pure-basis target up by that same amount lands the mixture
-                where it needs to be, using only the pure-component Psat and
-                Tsat curves -- no separate VLE call that could disagree with
-                the flash.
+                depression, measured rather than predicted, so shifting the
+                pure-basis target by that same amount lands the mixture where
+                it needs to be. Uses only the pure-component Psat and Tsat
+                curves -- no separate VLE call that could disagree with the
+                flash.
+
+                `cooling=False` puts effect 1 margin_K ABOVE the feed (the
+                duty > 0 case); `cooling=True` puts it margin_K BELOW (the
+                duty < 0 case).
                 """
                 import math as _m
                 try:
@@ -3045,14 +3158,14 @@ def _run_one_simulation(p, *, display=True):
                     _depr = float(_chem.Tsat(E301.P[0])) - _T_eff
                 except Exception:
                     return False
-                if not _m.isfinite(_depr) or _depr < 0.0 or _depr > 60.0:
+                if not _m.isfinite(_depr) or _depr < -20.0 or _depr > 60.0:
                     return False
+                _T_target = _T_feed - margin_K if cooling else _T_feed + margin_K
                 try:
-                    _P_new = float(_chem.Psat(_T_feed + margin_K + _depr))
+                    _P_new = float(_chem.Psat(_T_target + _depr))
                 except Exception:
                     return False
-                return _evap_apply_P(_P_new)
-
+                return _evap_apply_P(_P_new, allow_lower=cooling)
             def _resize_evap_bubble(margin_K):
                 """Resize from the mixture bubble point (pre-solve path).
 
@@ -3069,15 +3182,102 @@ def _run_one_simulation(p, *, display=True):
                     return False
                 return _evap_apply_P(_P_new)
 
-            def _simulate_with_evap_retry():
-                """sys.simulate(), raising P[0] if the feed self-flashes.
+            def _diagnose_evap(tag=""):
+                """Dump the first-effect state that decides the pinch check.
 
-                On a pinch failure the depression is measured from the
-                converged flash and P[0] is raised by exactly that much plus
-                the margin -- never more. Falls back to the bubble point if
-                the flash state cannot be read. Any other ValueError, and the
-                pinch error once the margins are exhausted, propagate
-                unchanged.
+                TEMPORARY. Everything here is read-only. The numbers that
+                matter are `duty` (its SIGN picks which check BioSTEAM
+                applies) and `V_first_effect` / `effect 1 vapour` (a value at
+                or near zero means effect 1 is doing no real work, and the
+                sign of a numerically noisy duty is deciding the outcome).
+                """
+                _L = ["--- evaporator diagnostic " + str(tag) + " ---"]
+
+                def _add(k, v):
+                    _L.append(f"{k:<24}= {v}")
+
+                try:
+                    _chem = tmo.settings.chemicals[solv]
+                    _feed = E301.ins[0]
+                    _f0 = E301.evaporators[0]
+                    _vap = _f0.outs[0]
+                    _liq = _f0.outs[1]
+                    _T_in = float(_feed.T)
+                    _T_out = float(_vap.T)
+                    _duty = float(_f0.H_out - _f0.H_in)
+
+                    _add("feed T (Tci)", f"{_T_in - 273.15:10.2f} C")
+                    _add("effect 1 T (Tco)", f"{_T_out - 273.15:10.2f} C")
+                    _add("Tco - Tci", f"{_T_out - _T_in:10.2f} K")
+                    _add("duty (H_out - H_in)",
+                         f"{_duty:14,.1f} kJ/hr  ->  "
+                         + ("HEATING, needs Tco > Tci" if _duty > 0 else
+                            "COOLING, needs Tco < Tci"))
+                    try:
+                        _add("|duty| / feed enthalpy",
+                             f"{abs(_duty) / max(abs(float(_feed.H)), 1e-9):10.4f}")
+                    except Exception:
+                        pass
+
+                    try:
+                        _add("pure-solvent Tsat(P0)",
+                             f"{float(_chem.Tsat(E301.P[0])) - 273.15:10.2f} C")
+                        _add("bp depression",
+                             f"{float(_chem.Tsat(E301.P[0])) - _T_out:10.2f} K")
+                    except Exception:
+                        pass
+
+                    _add("P (live)",
+                         str(tuple(round(float(_p)) for _p in E301.P)))
+                    _add("effects live / configured",
+                         f"{len(E301.evaporators)} / {evap_n_effects}")
+                    _add("V target / definition",
+                         f"{getattr(E301, 'V', None)} / "
+                         f"{getattr(E301, 'V_definition', None)}")
+                    _add("V_first_effect",
+                         str(getattr(E301, '_V_first_effect', None)))
+
+                    try:
+                        _add("effect 1 vapour",
+                             f"{float(_vap.F_mass):12,.2f} kg/hr")
+                        _add("effect 1 liquid",
+                             f"{float(_liq.F_mass):12,.2f} kg/hr")
+                        _add("feed", f"{float(_feed.F_mass):12,.2f} kg/hr")
+                    except Exception:
+                        pass
+
+                    try:
+                        _ph = getattr(_feed, 'phases', None) or getattr(
+                            _feed, 'phase', '?')
+                        _add("feed phase", str(_ph))
+                        _add("feed P", f"{float(_feed.P):12,.0f} Pa")
+                    except Exception:
+                        pass
+
+                    for _n, _ev in enumerate(E301.evaporators[1:], start=2):
+                        try:
+                            _q = _ev.design_results.get('Heat transfer', None)
+                            _add(f"effect {_n} heat transfer",
+                                 f"{float(_q):14,.1f}" if _q is not None
+                                 else "n/a")
+                        except Exception:
+                            pass
+                except Exception as _diag_err:
+                    _L.append(f"(diagnostic incomplete: "
+                              f"{type(_diag_err).__name__}: {_diag_err})")
+
+                _txt = "\n".join(_L)
+                print(_txt, flush=True)
+                if display:
+                    st.code(_txt)
+
+            def _simulate_with_evap_retry():
+                """sys.simulate(), correcting a first-effect pinch failure.
+
+                The heating-side correction (raise P[0]) is applied
+                automatically. The cooling-side one is held behind
+                _EVAP_AUTOFIX_COOLING while its direction is still being
+                confirmed: the state is dumped and the error re-raised.
                 """
                 _margins = (3.0, 6.0, 10.0)
                 for _i in range(len(_margins) + 1):
@@ -3085,14 +3285,27 @@ def _run_one_simulation(p, *, display=True):
                         sys.simulate()
                         return
                     except ValueError as _e:
-                        if "inlet must be cooler" not in str(_e):
+                        _msg = str(_e)
+                        _heating = "inlet must be cooler" in _msg
+                        _cooling = "inlet must be hotter" in _msg
+                        if not (_heating or _cooling):
                             raise
+                        _diagnose_evap(
+                            f"attempt {_i + 1}, "
+                            + ("HEATING branch" if _heating
+                               else "COOLING branch"))
                         if _i >= len(_margins):
                             raise
-                        if not (_resize_evap_measured(_margins[_i])
-                                or _resize_evap_bubble(_margins[_i])):
+                        if _cooling and not _EVAP_AUTOFIX_COOLING:
                             raise
-
+                        _mk = _margins[_i]
+                        if _heating:
+                            _ok = (_resize_evap_measured(_mk)
+                                   or _resize_evap_bubble(_mk))
+                        else:
+                            _ok = _resize_evap_measured(_mk, cooling=True)
+                        if not _ok:
+                            raise
             # Pre-size effect 1 off the primed extract before the first solve.
             # No-op when the stream is empty (no-recycle branch) or when the
             # feed is already cooler than the mixture boiling point.
