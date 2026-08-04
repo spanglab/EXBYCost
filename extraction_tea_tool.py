@@ -1093,6 +1093,308 @@ def _make_sweep_values(spec):
         vals = [float(v) for v in vals]
     return vals
 
+
+# ============================================================================
+# Sensitivity-analysis utilities (one-at-a-time / OAT)
+# ----------------------------------------------------------------------------
+# A sensitivity analysis is a restricted sweep: instead of the full Cartesian
+# grid, each selected parameter is run only at a low and a high bound while
+# every other parameter is held at its central (sidebar) value. One extra
+# "central" run supplies the baseline MSP that the tornado plot is built
+# around, so the total is 1 + 2 x (selected parameters).
+# ============================================================================
+
+def _sens_central_value(key, spec=None):
+    """Current sidebar value of a parameter, used as its central case.
+
+    Returns None when the parameter has no usable numeric value in the
+    current configuration (e.g. ExtractP_custom while the pressure mode is
+    not 'Custom', where the sidebar variable is None).
+    """
+    val = globals().get(key, None)
+    if val is None or isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
+def _clamp(value, lo, hi):
+    return min(max(value, lo), hi)
+
+
+def _num_input_kwargs(spec, value):
+    """min/max/value/step/format for st.number_input, all of one type.
+
+    Streamlit warns ("value below has type float, but format %d displays as
+    integer") whenever a float is passed alongside an integer format string,
+    so the integer-cast parameters -- evaporator effects, storage days,
+    plant life, operating days, finance years, start-up months -- have to be
+    handed ints for every bound as well as the value itself.
+    """
+    if spec.get('cast') is int:
+        lo, hi = int(spec['min']), int(spec['max'])
+        return dict(min_value=lo, max_value=hi,
+                    value=int(_clamp(int(round(value)), lo, hi)),
+                    step=1, format=spec['fmt'])
+    lo, hi = float(spec['min']), float(spec['max'])
+    return dict(min_value=lo, max_value=hi,
+                value=float(_clamp(float(value), lo, hi)),
+                format=spec['fmt'])
+
+
+def _make_sensitivity_bounds(central, spec, bound_mode, pct_down=None,
+                             pct_up=None, manual_lo=None, manual_hi=None):
+    """Return (low, central, high) for one parameter, clamped to its hard
+    bounds and cast the same way the sweep casts values.
+
+    bound_mode is 'percent' (bounds are central x (1 -/+ pct/100)) or
+    'manual' (bounds typed in directly).
+    """
+    hard_lo = float(spec['min'])
+    hard_hi = float(spec['max'])
+    c = float(central)
+    if bound_mode == 'percent':
+        lo = c * (1.0 - float(pct_down) / 100.0)
+        hi = c * (1.0 + float(pct_up) / 100.0)
+    else:
+        lo = float(manual_lo)
+        hi = float(manual_hi)
+    lo = _clamp(lo, hard_lo, hard_hi)
+    hi = _clamp(hi, hard_lo, hard_hi)
+    c = _clamp(c, hard_lo, hard_hi)
+    if spec.get('cast') is int:
+        return int(round(lo)), int(round(c)), int(round(hi))
+    return float(lo), float(c), float(hi)
+
+
+def _build_sensitivity_runs(sens_specs):
+    """Turn {param: {'low','central','high',...}} into the run list.
+
+    The first entry is the central/baseline run (no overrides). Each
+    subsequent entry overrides exactly one parameter. A bound that lands
+    exactly on the central value is skipped -- it would reproduce the
+    baseline run -- and is filled in from the baseline when the summary
+    table is built.
+
+    The reserved '__meta__' key is not applied to the model; the sweep
+    worker strips it and merges it into the results row so each row knows
+    which parameter and direction it belongs to.
+    """
+    # The baseline pins every tested parameter at its central value rather
+    # than relying on the sidebar value. They are normally identical, but
+    # pinning also covers centrals that were clamped to a hard bound, and
+    # makes the baseline share the legs' side effects (varying
+    # ExtractP_custom forces pressure_mode='Custom', so the baseline must
+    # be on Custom too or it is not the centre of that axis).
+    combos = [{**{k: s['central'] for k, s in sens_specs.items()},
+               '__meta__': {'case': 'central', 'parameter': '',
+                            'param_label': 'Central (baseline)',
+                            'direction': 'central', 'value': None}}]
+    for k, s in sens_specs.items():
+        for direction in ('low', 'high'):
+            v = s[direction]
+            if v == s['central']:
+                continue
+            combos.append({k: v,
+                           '__meta__': {'case': 'bound', 'parameter': k,
+                                        'param_label': s['label'],
+                                        'direction': direction, 'value': v}})
+    return combos
+
+
+def _sensitivity_summary_table(rows, sens_specs,
+                               msp_col='product_price_USD_per_kg'):
+    """Collapse the raw per-run rows into one row per parameter.
+
+    Returns (DataFrame sorted by swing, baseline MSP). Legs that failed or
+    were never run come back as NaN with the reason in a *_note column, so a
+    partially failed analysis still produces a usable table and plot.
+    """
+    base_msp = float('nan')
+    for r in rows:
+        if r.get('case') == 'central' and not r.get('error'):
+            try:
+                base_msp = float(r.get(msp_col))
+            except (TypeError, ValueError):
+                base_msp = float('nan')
+            break
+
+    recs = []
+    for k, s in sens_specs.items():
+        rec = {
+            'parameter': k,
+            'label': s['label'],
+            'bound_mode': s.get('bound_mode', ''),
+            'bound_setting': s.get('bound_setting', ''),
+            'low_value': s['low'],
+            'central_value': s['central'],
+            'high_value': s['high'],
+            'MSP_central_USD_per_kg': base_msp,
+        }
+        for d in ('low', 'high'):
+            msp, note = float('nan'), ''
+            if s[d] == s['central']:
+                msp, note = base_msp, 'bound equals central (not re-run)'
+            else:
+                match = next((r for r in rows
+                              if r.get('parameter') == k
+                              and r.get('direction') == d), None)
+                if match is None:
+                    note = 'not run'
+                elif match.get('error'):
+                    note = str(match['error'])
+                else:
+                    try:
+                        msp = float(match.get(msp_col))
+                    except (TypeError, ValueError):
+                        note = 'no MSP returned'
+            rec[f'MSP_{d}_USD_per_kg'] = msp
+            rec[f'{d}_note'] = note
+
+        lo_msp = rec['MSP_low_USD_per_kg']
+        hi_msp = rec['MSP_high_USD_per_kg']
+        rec['delta_low_USD_per_kg'] = lo_msp - base_msp
+        rec['delta_high_USD_per_kg'] = hi_msp - base_msp
+        finite = [v for v in (lo_msp, hi_msp) if np.isfinite(v)]
+        rec['swing_USD_per_kg'] = (max(finite) - min(finite)
+                                   if len(finite) == 2 else float('nan'))
+        # A central case lying outside its own bounds cannot be a real
+        # response to a monotonic input -- it means the run-to-run scatter
+        # is larger than the effect being measured.
+        rec['central_outside_bounds'] = bool(
+            len(finite) == 2 and np.isfinite(base_msp)
+            and not (min(finite) <= base_msp <= max(finite)))
+        if np.isfinite(rec['swing_USD_per_kg']) and base_msp not in (0,) \
+                and np.isfinite(base_msp) and base_msp != 0:
+            rec['swing_pct_of_central'] = 100.0 * rec['swing_USD_per_kg'] / base_msp
+        else:
+            rec['swing_pct_of_central'] = float('nan')
+        recs.append(rec)
+
+    df = pd.DataFrame(recs)
+    if not df.empty:
+        df = df.sort_values('swing_USD_per_kg', ascending=False,
+                            na_position='last').reset_index(drop=True)
+    return df, base_msp
+
+
+def _arrow_safe(df):
+    """Return a copy of df that Streamlit can hand to Arrow without raising.
+
+    st.dataframe serialises through pyarrow, which rejects an object column
+    holding more than one Python type ("Expected bytes, got a 'float'
+    object"). That happens naturally here: a column can be numeric on the
+    rows where a parameter was varied and blank/absent on the rows where it
+    was not, and a categorical sweep mixes strings with the NaNs of runs
+    that did not set it.
+
+    Columns that are entirely numeric once nulls are dropped become a real
+    numeric dtype; genuinely mixed columns are rendered as text. Nulls stay
+    null either way, so nothing displays as the string "nan". This only
+    affects what is shown on screen -- the CSV downloads still use the
+    original frame.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype != object:
+            continue
+        vals = out[col].dropna()
+        if vals.empty or len({type(v) for v in vals}) == 1:
+            continue
+        num = pd.to_numeric(out[col], errors='coerce')
+        if int(num.notna().sum()) == len(vals):
+            out[col] = num
+        else:
+            out[col] = out[col].map(
+                lambda v: v if v is None or (isinstance(v, float)
+                                             and not np.isfinite(v))
+                else str(v))
+    return out
+
+
+def _tornado_figure(df_sens, base_msp, fmt_map=None, max_bars=30):
+    """Tornado plot of MSP.
+
+    One full-height bar per parameter, with a black line at the central case
+    and both bounds running off it: whichever bound raises MSP extends to the
+    right of the line, whichever lowers it extends to the left. Colour tracks
+    which bound produced each side, so a parameter that MSP falls with (more
+    feed, say) shows its upper bound on the left.
+
+    If both bounds push MSP the same way -- a non-monotonic response, or a
+    central value that is not between its own bounds -- the shorter leg is
+    drawn in front of the longer one and its value label moves inside its own
+    bar. That situation is nearly always a sign the effect is smaller than
+    the solver's convergence tolerance; the summary table flags it in the
+    central_outside_bounds column.
+    """
+    fmt_map = fmt_map or {}
+    d = df_sens[np.isfinite(df_sens['MSP_low_USD_per_kg'])
+                | np.isfinite(df_sens['MSP_high_USD_per_kg'])]
+    d = d.head(max_bars)
+    n = len(d)
+    if n == 0 or not np.isfinite(base_msp):
+        return None
+
+    fig, ax = plt.subplots(figsize=(9.5, max(2.6, 0.52 * n + 1.5)))
+    colors = {'low': '#4C72B0', 'high': '#C44E52'}
+    bar_h = 0.62
+
+    # Largest swing on top: row i of the (already sorted) table sits at
+    # y = n-1-i, and the tick labels are written in the same order.
+    ypos, ylabels = [], []
+    for i, (_, r) in enumerate(d.iterrows()):
+        y = n - 1 - i
+        ypos.append(y)
+        ylabels.append(r['label'])
+
+        legs = []
+        for which in ('low', 'high'):
+            msp = r[f'MSP_{which}_USD_per_kg']
+            if np.isfinite(msp):
+                legs.append((abs(msp - base_msp), which, msp))
+        # Longest leg first so a shorter same-side leg stays visible on top.
+        legs.sort(reverse=True)
+        same_side = (len(legs) == 2 and
+                     (legs[0][2] - base_msp) * (legs[1][2] - base_msp) > 0)
+
+        for j, (_, which, msp) in enumerate(legs):
+            ax.barh(y, msp - base_msp, left=base_msp, height=bar_h,
+                    color=colors[which], edgecolor='white', linewidth=0.5,
+                    zorder=3 + j)
+            fmt = fmt_map.get(r['parameter'], '%.4g')
+            try:
+                vtxt = fmt % r[f'{which}_value']
+            except (TypeError, ValueError):
+                vtxt = str(r[f'{which}_value'])
+            outward = msp >= base_msp
+            if same_side and j == 1:
+                # Nested inside the longer leg: label goes in its own bar.
+                ax.text(msp, y, f"  {vtxt}  ", va='center',
+                        ha='right' if outward else 'left',
+                        fontsize=7.5, color='white', zorder=8)
+            else:
+                ax.text(msp, y, f"  {vtxt}  ", va='center',
+                        ha='left' if outward else 'right',
+                        fontsize=7.5, color='#333333', zorder=8)
+
+        # Central-case line, drawn per row so it reads as part of the bar.
+        ax.plot([base_msp, base_msp], [y - bar_h / 2, y + bar_h / 2],
+                color='black', linewidth=1.6, solid_capstyle='butt', zorder=7)
+
+    ax.axvline(base_msp, color='black', linewidth=0.8, alpha=0.4, zorder=1)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(ylabels, fontsize=9)
+    ax.set_ylim(-0.7, n - 0.3)
+    ax.set_xlabel('Minimum selling price ($/kg)')
+    ax.set_title(f'MSP sensitivity — central case ${base_msp:,.2f}/kg')
+    ax.grid(True, axis='x', alpha=0.3, zorder=0)
+    ax.set_axisbelow(True)
+    ax.margins(x=0.14)
+    for side in ('top', 'right', 'left'):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+    return fig
+
 # Define data dictionaries
 feedstocks = {
     'Tomato pomace': {
@@ -1417,12 +1719,15 @@ st.sidebar.header("📊 Input Parameters")
 # =========================================================================
 sim_mode = st.sidebar.radio(
     "Mode",
-    options=["Single Run", "Parameter Sweep"],
-    horizontal=True,
+    options=["Single Run", "Parameter Sweep", "Sensitivity Analysis"],
+    horizontal=False,
     help=("Single Run: solve one set of parameters and view the full TEA "
           "report. Parameter Sweep: choose one or more parameters to vary "
-          "over a range, run them all, and download the combined results "
-          "as a CSV."),
+          "over a range, run every combination, and download the combined "
+          "results as a CSV. Sensitivity Analysis: run each selected "
+          "parameter at a low, central and high value only (all others held "
+          "central) and get a tornado plot of the minimum selling price "
+          "plus a CSV."),
 )
 st.sidebar.markdown("---")
 
@@ -1776,6 +2081,52 @@ else:
         help="Hourly wage for operators of the facility ($/hr)"
     )
 
+# ---- Operators per shift -------------------------------------------------
+# Normally estimated from the plant's unit count (Alkhayat & Gerrard):
+#   N = round(sqrt(6.29 + 31.7*solid-handling steps + 0.23*other steps))
+# Custom pins the number directly, which is also what makes it available to
+# the sweep and sensitivity modes.
+operator_count_source = st.sidebar.radio(
+    "Operators per shift",
+    options=("Estimated from unit count", "Custom"),
+    help="Estimated applies the Alkhayat & Gerrard correlation to the "
+         "number of solid-handling and fluid-handling units actually built "
+         "for this flowsheet. Custom pins the headcount instead — needed if "
+         "you want to sweep it or include it in a sensitivity analysis.",
+)
+if operator_count_source == "Custom":
+    operators_per_shift_input = st.sidebar.number_input(
+        "Operators per shift (count)",
+        min_value=1, max_value=50, value=5, step=1,
+        help="Operators on duty at any time. Labour cost scales linearly "
+             "with this.",
+    )
+else:
+    operators_per_shift_input = None
+    st.sidebar.caption("Estimated per run from the built flowsheet.")
+
+# ---- Solvent price -------------------------------------------------------
+# Normally read from solvent_prices.csv for the selected solvent. Custom
+# overrides it, which also exposes it to the sweep and sensitivity modes.
+solv_price_source = st.sidebar.radio(
+    "Solvent price source",
+    options=("Price database", "Custom"),
+    help="Price database uses solvent_prices.csv for the selected solvent, "
+         "and follows the solvent automatically if you sweep solvent type. "
+         "Custom pins a $/kg figure instead — needed to sweep the price or "
+         "include it in a sensitivity analysis.",
+)
+if solv_price_source == "Custom":
+    solv_price_input = st.sidebar.number_input(
+        "Solvent Price ($/kg)",
+        min_value=0.0, max_value=1000.0,
+        value=float(solvprice_index.get(solv, 1.0)),
+        format="%.4f",
+        help="Purchase cost of make-up solvent per kg.",
+    )
+else:
+    solv_price_input = None
+
 # TEA Parameters — Default / Custom toggle
 # Ultrasound-assisted extraction is a first-of-a-kind (FOAK) process, so the
 # mature "Nth Plant" cost assumption doesn't apply — drop it from the options
@@ -2021,6 +2372,8 @@ NUMERIC_SWEEP_SPECS = {
     'elec_price':         {'label': 'Electricity price ($/kWh)',       'min': 0.0,    'max': 1.0,       'def_lo': 0.10,     'def_hi': 0.30,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
     'feed_price':         {'label': 'Feed price ($/kg)',                'min': 0.0,    'max': 100.0,     'def_lo': 0.0,      'def_hi': 0.50,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
     'operator_hourly_wage': {'label': 'Operator wage ($/hr)',           'min': 0.0,    'max': 200.0,     'def_lo': 18.0,     'def_hi': 35.0,     'fmt': '%.2f',  'cast': None, 'group': 'Economics'},
+    'operators_per_shift':  {'label': 'Operators per shift',            'min': 1,      'max': 50,        'def_lo': 3,        'def_hi': 10,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
+    'solv_price':         {'label': 'Solvent price ($/kg)',             'min': 0.0,    'max': 1000.0,    'def_lo': 0.50,     'def_hi': 3.00,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
     'feed_storage_days':  {'label': 'Feed storage (days)',              'min': 1,      'max': 30,        'def_lo': 3,        'def_hi': 14,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
     'solv_storage_days':  {'label': 'Solvent storage (days)',           'min': 1,      'max': 30,        'def_lo': 3,        'def_hi': 14,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
     # TEA
@@ -2059,6 +2412,22 @@ CATEGORICAL_SWEEP_SPECS = {
 sweep_values = {}       # {param_name: [v1, v2, ...]}
 sweep_summary_labels = {}
 
+# Central values for the two overridable-but-normally-derived parameters.
+# These are what _sens_central_value() reports, so they must be named after
+# the override keys. solv_price falls back to the database price for the
+# currently selected solvent so a sensitivity centred on it is still
+# meaningful without switching the sidebar to Custom first; operators has no
+# value until a flowsheet is built, so it stays None and the sensitivity
+# panel asks for one.
+solv_price = (float(solv_price_input) if solv_price_input is not None
+              else float(solvprice_index.get(solv, 0.0)))
+operators_per_shift = operators_per_shift_input
+
+# Sidebar display order for the numeric parameter groups (shared by the
+# Parameter Sweep and Sensitivity Analysis configuration panels).
+SWEEP_GROUPS_ORDERED = ['Process', 'Feed drying', 'Concentration', 'Recycle',
+                        'Economics', 'TEA']
+
 if sim_mode == "Parameter Sweep":
     st.sidebar.markdown("---")
     st.sidebar.subheader("🔄 Parameter Sweep")
@@ -2069,9 +2438,7 @@ if sim_mode == "Parameter Sweep":
     )
 
     # Numeric sweeps, organised by group
-    groups_ordered = ['Process', 'Feed drying', 'Concentration', 'Recycle',
-                      'Economics', 'TEA']
-    for group in groups_ordered:
+    for group in SWEEP_GROUPS_ORDERED:
         group_keys = [k for k, s in NUMERIC_SWEEP_SPECS.items()
                       if s['group'] == group]
         if not group_keys:
@@ -2179,13 +2546,190 @@ if sim_mode == "Parameter Sweep":
     else:
         st.sidebar.info("Tick at least one parameter to enable the sweep.")
 
+# =========================================================================
+# Sensitivity Analysis Configuration (only in Sensitivity Analysis mode)
+# =========================================================================
+# One-at-a-time sensitivity. Every ticked parameter is run at a lower and an
+# upper bound while all other parameters stay at their central (sidebar)
+# value, so each result is attributable to a single input. Bounds come
+# either from a +/- % of the central value or from manually typed numbers.
+sens_specs = {}            # {param: {'label','low','central','high',...}}
+sens_summary_labels = {}
+
+if sim_mode == "Sensitivity Analysis":
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 Sensitivity Analysis")
+    st.sidebar.caption(
+        "Tick the parameters to test. Each one is run at a lower and an "
+        "upper bound with every other parameter held at its central "
+        "(sidebar) value. Bounds are set either as a ± % of the central "
+        "value or typed in directly."
+    )
+
+    sens_default_pct = st.sidebar.number_input(
+        "Default variation (± %)",
+        min_value=0.1, max_value=500.0, value=20.0, step=5.0,
+        key="sens_default_pct",
+        help="Starting value for the ± % boxes below. Each parameter can "
+             "still be given its own percentages or manual bounds.",
+    )
+
+    for group in SWEEP_GROUPS_ORDERED:
+        group_keys = [k for k, s in NUMERIC_SWEEP_SPECS.items()
+                      if s['group'] == group]
+        if not group_keys:
+            continue
+        n_active = sum(1 for k in group_keys
+                       if st.session_state.get(f'sens_{k}', False))
+        header = f"{group}  ·  {n_active} varied" if n_active else group
+        with st.sidebar.expander(header, expanded=False):
+            for k in group_keys:
+                spec = NUMERIC_SWEEP_SPECS[k]
+                enabled = st.checkbox(
+                    f"Vary **{spec['label']}**",
+                    key=f"sens_{k}",
+                )
+                if not enabled:
+                    continue
+
+                central = _sens_central_value(k, spec)
+                if central is None:
+                    # Parameter has no live sidebar value in this
+                    # configuration (e.g. custom extraction pressure while
+                    # the pressure mode is Automatic). Let the user set a
+                    # central value explicitly.
+                    st.caption(
+                        "⚠️ No central value is set in the sidebar for this "
+                        "parameter in the current configuration — enter one "
+                        "below."
+                    )
+                    central = st.number_input(
+                        "Central value",
+                        key=f"sens_{k}_central",
+                        **_num_input_kwargs(
+                            spec, (spec['def_lo'] + spec['def_hi']) / 2.0),
+                    )
+                fmt = spec['fmt']
+                try:
+                    central_txt = fmt % central
+                except (TypeError, ValueError):
+                    central_txt = str(central)
+                st.caption(f"Central value: **{central_txt}**")
+
+                bound_mode = st.radio(
+                    "Bounds from",
+                    options=["± % of central", "Manual bounds"],
+                    horizontal=True,
+                    key=f"sens_{k}_bmode",
+                    help="± %: bounds are the central value scaled down and "
+                         "up by the percentages given. Manual: type the "
+                         "lower and upper values directly.",
+                )
+
+                if bound_mode == "± % of central":
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        pct_down = st.number_input(
+                            "Decrease (−%)",
+                            min_value=0.0, max_value=100.0,
+                            value=float(sens_default_pct), step=1.0,
+                            key=f"sens_{k}_pdn",
+                        )
+                    with c2:
+                        pct_up = st.number_input(
+                            "Increase (+%)",
+                            min_value=0.0, max_value=1000.0,
+                            value=float(sens_default_pct), step=1.0,
+                            key=f"sens_{k}_pup",
+                        )
+                    lo, cen, hi = _make_sensitivity_bounds(
+                        central, spec, 'percent',
+                        pct_down=pct_down, pct_up=pct_up)
+                    bound_setting = f"-{pct_down:g}% / +{pct_up:g}%"
+                else:
+                    _def_lo = (central * 0.8 if central
+                               else float(spec['def_lo']))
+                    _def_hi = (central * 1.2 if central
+                               else float(spec['def_hi']))
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        man_lo = st.number_input(
+                            "Lower bound", key=f"sens_{k}_lo",
+                            **_num_input_kwargs(spec, _def_lo),
+                        )
+                    with c2:
+                        man_hi = st.number_input(
+                            "Upper bound", key=f"sens_{k}_hi",
+                            **_num_input_kwargs(spec, _def_hi),
+                        )
+                    lo, cen, hi = _make_sensitivity_bounds(
+                        central, spec, 'manual',
+                        manual_lo=man_lo, manual_hi=man_hi)
+                    bound_setting = "manual"
+
+                if hi < lo:
+                    st.warning(
+                        f"Upper bound must be at or above the lower bound "
+                        f"for {spec['label']}."
+                    )
+                    continue
+                if lo == hi == cen:
+                    st.warning(
+                        f"Bounds collapse onto the central value for "
+                        f"{spec['label']} — nothing to vary."
+                    )
+                    continue
+                if not (lo <= cen <= hi):
+                    st.caption(
+                        "ℹ️ The central value sits outside these bounds; the "
+                        "baseline run still uses the central value."
+                    )
+
+                sens_specs[k] = {
+                    'label': spec['label'],
+                    'low': lo, 'central': cen, 'high': hi,
+                    'fmt': fmt, 'cast': spec['cast'],
+                    'bound_mode': ('percent' if bound_mode.startswith('±')
+                                   else 'manual'),
+                    'bound_setting': bound_setting,
+                }
+                sens_summary_labels[k] = spec['label']
+
+                def _p(v):
+                    try:
+                        return fmt % v
+                    except (TypeError, ValueError):
+                        return str(v)
+                st.caption(
+                    f"→ low **{_p(lo)}** · central **{_p(cen)}** · "
+                    f"high **{_p(hi)}**"
+                )
+
+    if sens_specs:
+        _n_legs = sum(1 for s in sens_specs.values()
+                      for d in ('low', 'high') if s[d] != s['central'])
+        st.sidebar.success(
+            f"📊 **{_n_legs + 1} run(s)** — 1 central + {_n_legs} bound "
+            f"run(s) across {len(sens_specs)} parameter(s)"
+        )
+        if _n_legs + 1 > 60:
+            st.sidebar.warning(
+                f"⚠️ {_n_legs + 1} runs may take a long time — consider "
+                "testing fewer parameters."
+            )
+    else:
+        st.sidebar.info(
+            "Tick at least one parameter to enable the sensitivity analysis."
+        )
+
 # Run button — label depends on mode
 if sim_mode == "Single Run":
     run_simulation = st.sidebar.button(
         "🚀 Run Simulation", type="primary", use_container_width=True
     )
     run_sweep = False
-else:
+    run_sensitivity = False
+elif sim_mode == "Parameter Sweep":
     run_sweep = st.sidebar.button(
         "🚀 Run Sweep",
         type="primary",
@@ -2193,6 +2737,16 @@ else:
         disabled=not sweep_values,
     )
     run_simulation = False
+    run_sensitivity = False
+else:
+    run_sensitivity = st.sidebar.button(
+        "🚀 Run Sensitivity Analysis",
+        type="primary",
+        use_container_width=True,
+        disabled=not sens_specs,
+    )
+    run_simulation = False
+    run_sweep = False
 
 # =========================================================================
 # Feedstock Composition Display (main area)
@@ -2356,8 +2910,14 @@ def _run_one_simulation(p, *, display=True):
             feedstock_type = feedstocks[selected_feedstock]['type']
             porosity_tortuosity_ratio = porosity_torosity[feedstock_type]
 
-            # Get solvent price
-            solv_price = solvprice_index[solv]
+            # Get solvent price. A value supplied in p (sidebar Custom, or a
+            # sweep/sensitivity override) wins; otherwise look it up for the
+            # selected solvent as before, so sweeping solvent type still
+            # picks up each solvent's own price.
+            _solv_price_override = p.get('solv_price')
+            solv_price = (float(_solv_price_override)
+                          if _solv_price_override is not None
+                          else solvprice_index[solv])
 
             # Define chemicals
             Solvchems = ['ethanol', 'hexane', 'acetone', 'water', 'chloroform']
@@ -3420,8 +3980,14 @@ def _run_one_simulation(p, *, display=True):
                     non_solid_units_list.append(unit.ID)
 
             # Calculate operators per shift using the formula:
-            operators_per_shift = round(
+            # The correlation is still evaluated even when overridden, so the
+            # estimate stays available for comparison in the results.
+            operators_per_shift_est = round(
                 (6.29 + 31.7 * (steps_involving_solids) + 0.23 * (steps_not_involving_solids)) ** 0.5)
+            _ops_override = p.get('operators_per_shift')
+            operators_per_shift = (int(_ops_override)
+                                   if _ops_override is not None
+                                   else operators_per_shift_est)
             # Calculate total labor cost
             hours_per_year = 24 * operating_days  # Total hours in a year for continuous operation
             labor_cost = operator_hourly_wage * operators_per_shift * hours_per_year * (1+supervision_factor)
@@ -3678,6 +4244,10 @@ def _run_one_simulation(p, *, display=True):
                 'annual_utility_cost_USD':  annual_utility_cost,
                 'labor_cost_USD_per_yr':    labor_cost_val,
                 'operators_per_shift':      operators_per_shift,
+                'operators_per_shift_estimated': operators_per_shift_est,
+                'operators_per_shift_overridden': _ops_override is not None,
+                'solv_price_USD_per_kg':    solv_price,
+                'solv_price_overridden':    _solv_price_override is not None,
                 'cooled_product_kg_per_hr': product_F_kghr,
                 'cooled_product_residual_solvent_frac': residual_solvent_frac,
                 'cooled_product_T_C':       product_T_C,
@@ -3929,6 +4499,194 @@ def _run_one_simulation(p, *, display=True):
                     st.write(f"**Extraction Temp:** {ExtractT}°C")
                     st.write(f"**Extraction Time:** {extractt} hr")
                     st.write(f"**Pressure Mode:** {pressure_mode}")
+
+                st.markdown("---")
+                st.subheader("🥧 Contribution to Minimum Selling Price")
+
+                _msp_capital_items = []
+                for _u in sys.units:
+                    if _u.installed_cost > 0:
+                        _msp_capital_items.append((_u.ID, _u.installed_cost))
+                _msp_installed_total = sum(v for _, v in _msp_capital_items)
+                _msp_additional_direct = (
+                    _msp_installed_total * tea.Additional_direct_costs)
+                if _msp_additional_direct > 0:
+                    _msp_capital_items.append(
+                        ('Additional Direct Costs', _msp_additional_direct))
+                _msp_indirect = tea.DPI * tea.indirect_costs
+                if _msp_indirect > 0:
+                    _msp_capital_items.append(('Indirect Costs', _msp_indirect))
+                _msp_working_capital = tea.WC_over_FCI * fci
+                if _msp_working_capital > 0:
+                    _msp_capital_items.append(
+                        ('Working Capital', _msp_working_capital))
+
+                _msp_operating_items = [
+                    ('Maintenance', maintenance_cost),
+                    ('Property Insurance', insurance_cost),
+                    ('Property Tax', tax_cost),
+                    ('Labor', labor_cost_val),
+                    ('Fringe Benefits', fringe_cost),
+                    ('Supplies', supplies_cost),
+                    ('Administration', admin_cost),
+                    ('Raw Materials', annual_material_cost),
+                    ('Utilities', annual_utility_cost),
+                ]
+
+                # Capital recovery factor at the plant's own IRR and life --
+                # converts a one-time capital $ into a $/yr charge comparable
+                # to the operating costs above. Falls back to straight-line
+                # (1/duration) on the degenerate IRR == 0 case.
+                _msp_crf = (
+                    IRR * (1 + IRR) ** duration / ((1 + IRR) ** duration - 1)
+                    if IRR > 0 else 1.0 / duration)
+
+                _msp_rows = (
+                    [(name, cost * _msp_crf, 'Capital')
+                     for name, cost in _msp_capital_items]
+                    + [(name, cost, 'Operating')
+                       for name, cost in _msp_operating_items]
+                )
+                _msp_total = sum(v for _, v, _c in _msp_rows)
+
+                if _msp_total > 0:
+                    _msp_slices, _msp_other = [], 0.0
+                    for _name, _val, _cat in _msp_rows:
+                        _pct = _val / _msp_total * 100
+                        if _pct >= 1.0:
+                            _msp_slices.append((_name, _val, _cat, _pct))
+                        else:
+                            _msp_other += _val
+                    _msp_slices.sort(key=lambda r: -r[1])
+                    if _msp_other > 0:
+                        _msp_slices.append((
+                            'Other (<1% each)', _msp_other, 'Other',
+                            _msp_other / _msp_total * 100))
+
+                    _msp_cap_total = sum(v for _, v, c in _msp_rows if c == 'Capital')
+                    _msp_op_total = sum(v for _, v, c in _msp_rows if c == 'Operating')
+
+                    mcol1, mcol2, mcol3 = st.columns(3)
+                    with mcol1:
+                        st.metric(
+                            "Capital contribution",
+                            f"{_msp_cap_total / _msp_total * 100:.1f}%",
+                            help=f"Annualized capital: ${_msp_cap_total:,.0f}/yr "
+                                 f"(TCI ${tci:,.0f} × CRF {_msp_crf:.4f})")
+                    with mcol2:
+                        st.metric(
+                            "Operating contribution",
+                            f"{_msp_op_total / _msp_total * 100:.1f}%",
+                            help=f"Annual operating cost: ${_msp_op_total:,.0f}/yr")
+                    with mcol3:
+                        st.metric("Total annualized cost", f"${_msp_total:,.0f}/yr")
+
+                    _msp_cap_cmap = plt.cm.Oranges
+                    _msp_op_cmap = plt.cm.Blues
+                    _n_cap = max(1, sum(1 for r in _msp_slices if r[2] == 'Capital'))
+                    _n_op = max(1, sum(1 for r in _msp_slices if r[2] == 'Operating'))
+                    _cap_i = _op_i = 0
+                    _msp_slice_colors = []
+                    for _name, _val, _cat, _pct in _msp_slices:
+                        if _cat == 'Capital':
+                            _msp_slice_colors.append(
+                                _msp_cap_cmap(0.4 + 0.5 * _cap_i / _n_cap))
+                            _cap_i += 1
+                        elif _cat == 'Operating':
+                            _msp_slice_colors.append(
+                                _msp_op_cmap(0.4 + 0.5 * _op_i / _n_op))
+                            _op_i += 1
+                        else:
+                            _msp_slice_colors.append('lightgray')
+
+                    fig_msp, ax_msp = plt.subplots(figsize=(12, 9))
+
+                    def _msp_autopct(pct):
+                        # Suppress the in-wedge % text on slivers too thin to
+                        # hold it without colliding with its neighbors.
+                        return f"{pct:.1f}%" if pct >= 3 else ""
+
+                    # counterclock=False lays wedges out clockwise from 12
+                    # o'clock, like a clock face. With the default
+                    # (counterclockwise) a big first slice wraps around to
+                    # the left, which forces its label line to cut
+                    # diagonally back across the whole chart.
+                    wedges_msp, _, autotexts_msp = ax_msp.pie(
+                        [r[1] for r in _msp_slices],
+                        labels=None,
+                        autopct=_msp_autopct,
+                        startangle=90,
+                        counterclock=False,
+                        colors=_msp_slice_colors,
+                        pctdistance=0.75,
+                        wedgeprops={'linewidth': 1, 'edgecolor': 'white'},
+                    )
+                    for _at in autotexts_msp:
+                        _at.set_color('white')
+                        _at.set_fontweight('bold')
+                        _at.set_fontsize(9)
+
+                    # Put each item's name outside the pie with a two-segment
+                    # "elbow" leader line: straight out from the wedge, then
+                    # level across to a label column. Labels are split onto a
+                    # left column and a right column and given evenly-spaced
+                    # vertical slots (ordered top-to-bottom to match each
+                    # wedge's angular position), so no two labels can ever
+                    # overlap regardless of how many thin slices there are,
+                    # and the level second segment keeps lines from cutting
+                    # back across the pie's interior.
+                    _mid_angles = [
+                        (w.theta1 + w.theta2) / 2 % 360 for w in wedges_msp]
+                    _right_idx = [i for i, a in enumerate(_mid_angles)
+                                  if _math.cos(_math.radians(a)) >= 0]
+                    _left_idx = [i for i, a in enumerate(_mid_angles)
+                                 if _math.cos(_math.radians(a)) < 0]
+
+                    def _place_labels(idxs, side):
+                        n = len(idxs)
+                        if n == 0:
+                            return
+                        idxs_sorted = sorted(
+                            idxs,
+                            key=lambda i: -_math.sin(_math.radians(_mid_angles[i])))
+                        ys = np.linspace(1.15, -1.15, n) if n > 1 else [0.0]
+                        x_col = 1.5 * side
+                        x_elbow = 1.35 * side
+                        for y, i in zip(ys, idxs_sorted):
+                            ang = _math.radians(_mid_angles[i])
+                            x_edge, y_edge = _math.cos(ang), _math.sin(ang)
+                            name, val, cat, pct = _msp_slices[i]
+                            ax_msp.plot(
+                                [x_edge, x_elbow, x_col], [y_edge, y, y],
+                                color='#999999', lw=0.7, zorder=1)
+                            ax_msp.text(
+                                x_col + 0.03 * side, y,
+                                f"{name} ({pct:.1f}%)",
+                                ha='left' if side > 0 else 'right',
+                                va='center', fontsize=8.5)
+
+                    _place_labels(_right_idx, 1)
+                    _place_labels(_left_idx, -1)
+
+                    ax_msp.set_title(
+                        'Contribution to Minimum Selling Price',
+                        fontsize=13, fontweight='bold', pad=20)
+                    ax_msp.set_xlim(-2.2, 2.2)
+                    ax_msp.set_ylim(-1.3, 1.3)
+                    ax_msp.set_aspect('equal')
+                    from matplotlib.patches import Patch as _MSPPatch
+                    ax_msp.legend(
+                        handles=[
+                            _MSPPatch(facecolor=_msp_cap_cmap(0.7), label='Capital'),
+                            _MSPPatch(facecolor=_msp_op_cmap(0.7), label='Operating'),
+                            _MSPPatch(facecolor='lightgray', label='Other (<1% each)'),
+                        ],
+                        loc='upper center', bbox_to_anchor=(0.5, -0.04),
+                        ncol=3, frameon=False)
+                    fig_msp.subplots_adjust(left=0.03, right=0.97, top=0.88, bottom=0.1)
+                    st.pyplot(fig_msp)
+                else:
+                    st.info("No cost data available to build the contribution chart.")
 
                 st.markdown("---")
                 try:
@@ -4577,6 +5335,13 @@ def _collect_base_params():
         'feed_storage_days':        feed_storage_days,
         'solv_storage_days':        solv_storage_days,
         'operator_hourly_wage':     operator_hourly_wage,
+        # None => derive as before (price lookup / unit-count correlation).
+        'solv_price':               (float(solv_price_input)
+                                     if solv_price_input is not None
+                                     else None),
+        'operators_per_shift':      (int(operators_per_shift_input)
+                                     if operators_per_shift_input is not None
+                                     else None),
         'IRR':                      IRR,
         'duration':                 duration,
         'operating_days':           operating_days,
@@ -4641,6 +5406,12 @@ def _sweep_worker(state, base_params, combos, tea_mode_snapshot, results_path):
         if i < state['completed']:
             continue
 
+        # '__meta__' is bookkeeping (sensitivity case/parameter/direction),
+        # not a model input: strip it before building params and merge it
+        # into the results row afterwards.
+        meta = dict(overrides.get('__meta__') or {})
+        overrides = {k: v for k, v in overrides.items() if k != '__meta__'}
+
         params = {**base_params, **overrides}
         if 'ExtractP_custom' in overrides:
             params['pressure_mode'] = 'Custom'
@@ -4659,18 +5430,19 @@ def _sweep_worker(state, base_params, combos, tea_mode_snapshot, results_path):
                 scalars = _run_one_simulation(params, display=False)
             run_dt = time.time() - run_start
             if scalars is not None:
-                row = {**overrides, **scalars, 'tea_forced_foak': _forced_foak,
+                row = {**meta, **overrides, **scalars,
+                       'tea_forced_foak': _forced_foak,
                        'run_time_s': run_dt, 'error': ''}
             else:
-                row = {**overrides, 'tea_forced_foak': _forced_foak,
+                row = {**meta, **overrides, 'tea_forced_foak': _forced_foak,
                        'run_time_s': run_dt, 'error': 'no result returned'}
             err_row = None
         except Exception as exc:
             run_dt = time.time() - run_start
             err_msg = f"{type(exc).__name__}: {exc}"
-            row = {**overrides, 'tea_forced_foak': _forced_foak,
+            row = {**meta, **overrides, 'tea_forced_foak': _forced_foak,
                    'run_time_s': run_dt, 'error': err_msg}
-            err_row = {**overrides, 'error': err_msg}
+            err_row = {**meta, **overrides, 'error': err_msg}
 
         with state['lock']:
             state['results_rows'].append(row)
@@ -4693,14 +5465,40 @@ def _sweep_worker(state, base_params, combos, tea_mode_snapshot, results_path):
         state['finished_at'] = time.time()
 
 
+def _stop_any_active_run(keep_key=None):
+    """Signal Stop to any sweep/sensitivity run other than keep_key.
+
+    BioSTEAM's global flowsheet means only one simulation can run at a time
+    (_SIM_LOCK enforces it), so starting a new run should retire the old one
+    rather than queue behind it.
+    """
+    for slot in ('sweep_active', 'sens_active'):
+        k = st.session_state.get(slot)
+        if not k or k == keep_key:
+            continue
+        s = st.session_state.get(k)
+        if s and s.get('running') and s.get('stop') is not None:
+            s['stop'].set()
+
+
 def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
-                 labels, fresh=False):
+                 labels, fresh=False, mode='sweep', sens_specs=None,
+                 active_slot='sweep_active'):
     """Build shared state, optionally resume from disk, and launch the thread.
 
-    Returns the session_state key under which the sweep state is stored.
+    mode is 'sweep' (full grid) or 'sensitivity' (one-at-a-time bounds); it
+    only affects how the results are rendered, not how they are executed.
+    Returns the session_state key under which the run state is stored.
     """
-    sweep_key = "sweep_" + hashlib.md5(
-        str(sorted(sweep_values.items())).encode("utf-8")).hexdigest()[:16]
+    _stop_any_active_run()
+    # The sweep key doubles as the on-disk resume filename, so the 'sweep'
+    # form is kept byte-identical to what earlier versions wrote -- a sweep
+    # stopped before this mode was added still resumes. Only the new
+    # sensitivity mode gets a distinct namespace.
+    _key_src = (str(sorted(sweep_values.items())) if mode == 'sweep'
+                else mode + str(sorted(sweep_values.items())))
+    sweep_key = f"{mode}_" + hashlib.md5(
+        _key_src.encode("utf-8")).hexdigest()[:16]
     results_path = _sweep_results_path(sweep_key)
     state_key = f"sweepstate_{sweep_key}"
 
@@ -4751,6 +5549,12 @@ def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
         'sweep_values': dict(sweep_values),
         'labels': dict(labels),
         'results_path': results_path,
+        'mode': mode,
+        'sens_specs': dict(sens_specs) if sens_specs else {},
+        # Governs the noise floor quoted on the tornado plot: with recycle
+        # on, sys.relative_molar_tolerance (1e-3) sets how tightly any two
+        # runs can be expected to agree.
+        'enable_recycle': bool(base_params.get('enable_recycle', False)),
     }
 
     t = threading.Thread(
@@ -4761,7 +5565,7 @@ def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
     t.start()
     state['thread'] = t
     st.session_state[state_key] = state
-    st.session_state['sweep_active'] = state_key
+    st.session_state[active_slot] = state_key
     return state_key
 
 
@@ -4784,17 +5588,23 @@ def _render_sweep(state):
         labels = state['labels']
         sweep_values = state['sweep_values']
         results_path = state['results_path']
+        mode = state.get('mode', 'sweep')
+        sens_specs = dict(state.get('sens_specs') or {})
+        sens_recycle = bool(state.get('enable_recycle', False))
+
+    is_sens = (mode == 'sensitivity')
+    noun = "sensitivity analysis" if is_sens else "sweep"
 
     # ---- Controls ----------------------------------------------------------
     if running:
         c1, c2 = st.columns([1, 3])
         with c1:
-            if st.button("⏹️ Stop sweep", type="secondary",
+            if st.button(f"⏹️ Stop {noun}", type="secondary",
                          use_container_width=True, key="sweep_stop_btn"):
                 state['stop'].set()
                 st.warning("Stopping after the current run finishes…")
         with c2:
-            st.caption("The sweep runs in the background — you can change "
+            st.caption(f"The {noun} runs in the background — you can change "
                        "sidebar values, switch tabs, or let the screen idle "
                        "without interrupting it. It stops only when you press "
                        "Stop or it finishes.")
@@ -4828,14 +5638,17 @@ def _render_sweep(state):
     else:
         n_ok = len([r for r in rows if not r.get('error')])
         n_fail = len(err_rows)
+        _resume_btn = ("Run Sensitivity Analysis" if is_sens
+                       else "Run Sweep")
         if state['stop'].is_set() and completed < n_total:
-            st.warning(f"⏹️ Sweep stopped — {completed} of {n_total} run(s) "
-                       f"completed in **{_fmt_duration(elapsed)}** "
-                       f"({n_ok} ok, {n_fail} failed). Press **Run Sweep** "
-                       f"again to resume from here.")
-        else:
-            st.success(f"✅ Sweep complete — {completed} run(s) in "
+            st.warning(f"⏹️ {noun.capitalize()} stopped — {completed} of "
+                       f"{n_total} run(s) completed in "
                        f"**{_fmt_duration(elapsed)}** "
+                       f"({n_ok} ok, {n_fail} failed). Press "
+                       f"**{_resume_btn}** again to resume from here.")
+        else:
+            st.success(f"✅ {noun.capitalize()} complete — {completed} run(s) "
+                       f"in **{_fmt_duration(elapsed)}** "
                        f"({n_ok} ok, {n_fail} failed)")
 
     if not rows:
@@ -4849,18 +5662,21 @@ def _render_sweep(state):
 
     st.markdown("### 📋 Results"
                 + ("  ·  *live*" if running else " preview"))
-    st.dataframe(df_results, use_container_width=True, hide_index=True)
+    st.dataframe(_arrow_safe(df_results), use_container_width=True,
+                 hide_index=True)
 
-    # CSV download — works mid-sweep (downloads whatever is done so far).
+    # CSV download — works mid-run (downloads whatever is done so far).
     csv_bytes = df_results.to_csv(index=False).encode('utf-8')
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    _stem = "sensitivity_runs" if is_sens else "sweep"
     st.download_button(
         label=("⬇️ Download results so far (CSV)" if running
-               else "⬇️ Download results as CSV"),
+               else ("⬇️ Download all run results as CSV" if is_sens
+                     else "⬇️ Download results as CSV")),
         data=csv_bytes,
-        file_name=f"extraction_sweep_{timestamp}.csv",
+        file_name=f"extraction_{_stem}_{timestamp}.csv",
         mime="text/csv",
-        type="primary",
+        type=("secondary" if is_sens else "primary"),
         use_container_width=True,
         key="sweep_csv_dl",
     )
@@ -4868,11 +5684,104 @@ def _render_sweep(state):
     if err_rows:
         with st.expander(f"⚠️ {len(err_rows)} run(s) failed — details",
                          expanded=False):
-            st.dataframe(pd.DataFrame(err_rows),
+            st.dataframe(_arrow_safe(pd.DataFrame(err_rows)),
                          use_container_width=True, hide_index=True)
 
-    # ---- Single-parameter sensitivity plot (only once finished) ------------
-    if not running:
+    # ---- Sensitivity summary + tornado plot (only once finished) ----------
+    if is_sens and not running and sens_specs:
+        df_sens, base_msp = _sensitivity_summary_table(rows, sens_specs)
+
+        st.markdown("### 🎯 MSP sensitivity")
+        if not np.isfinite(base_msp):
+            st.error(
+                "The central (baseline) run did not produce a minimum "
+                "selling price, so the tornado plot cannot be centred. "
+                "Check the failed-run details above."
+            )
+        else:
+            st.metric("Baseline MSP", f"${base_msp:,.2f}/kg")
+
+            # Convergence noise floor. The recycle loop stops at
+            # sys.relative_molar_tolerance = 1e-3, so two runs of the same
+            # flowsheet agree to roughly 0.1% and no smaller effect than
+            # that can be resolved. Any parameter whose whole swing sits
+            # inside that band is reporting solver scatter, not economics.
+            _NOISE_PCT = 0.1 if sens_recycle else 0.0
+            if _NOISE_PCT:
+                _swing_pct = df_sens['swing_pct_of_central'].abs()
+                _buried = df_sens[np.isfinite(_swing_pct)
+                                  & (_swing_pct < _NOISE_PCT)]
+                _inverted = df_sens[df_sens.get(
+                    'central_outside_bounds', False) == True]  # noqa: E712
+                if len(_buried) or len(_inverted):
+                    _names = list(dict.fromkeys(
+                        list(_buried['label']) + list(_inverted['label'])))
+                    st.warning(
+                        "⚠️ **Below the convergence noise floor.** The "
+                        "recycle loop converges to a relative molar "
+                        f"tolerance of 1e-3, so any two runs agree only to "
+                        f"about ±{_NOISE_PCT:g}% of MSP. These parameters "
+                        "moved MSP by less than that, so their bars show "
+                        "solver scatter rather than a real response: "
+                        + ", ".join(f"**{x}**" for x in _names)
+                        + (".  \n\nA central case sitting outside its own "
+                           "bounds (see the *central_outside_bounds* column) "
+                           "is the giveaway — that cannot happen for a "
+                           "monotonic input. To resolve an effect this "
+                           "small, widen the bounds, or tighten "
+                           "`sys.relative_molar_tolerance` and re-run."
+                           if len(_inverted) else "."))
+
+            _fmt_map = {k: s.get('fmt', '%.4g') for k, s in sens_specs.items()}
+            try:
+                fig_t = _tornado_figure(df_sens, base_msp, fmt_map=_fmt_map)
+            except Exception as exc:
+                fig_t = None
+                st.warning(f"Could not draw the tornado plot: {exc}")
+            if fig_t is not None:
+                st.pyplot(fig_t)
+                try:
+                    _png = io.BytesIO()
+                    fig_t.savefig(_png, format='png', dpi=200,
+                                  bbox_inches='tight')
+                    st.download_button(
+                        "⬇️ Download tornado plot (PNG)",
+                        data=_png.getvalue(),
+                        file_name=f"msp_tornado_{timestamp}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                        key="sens_png_dl",
+                    )
+                except Exception:
+                    pass
+
+        _disp_cols = [c for c in [
+            'label', 'bound_mode', 'bound_setting', 'low_value',
+            'central_value', 'high_value', 'MSP_low_USD_per_kg',
+            'MSP_central_USD_per_kg', 'MSP_high_USD_per_kg',
+            'delta_low_USD_per_kg', 'delta_high_USD_per_kg',
+            'swing_USD_per_kg', 'swing_pct_of_central',
+            'central_outside_bounds', 'low_note', 'high_note']
+            if c in df_sens.columns]
+        st.markdown("#### Summary by parameter")
+        st.dataframe(_arrow_safe(df_sens[_disp_cols]),
+                     use_container_width=True, hide_index=True)
+        st.caption(
+            "Swing is the MSP spread between the two bounds — the width of "
+            "each tornado bar, and the sort order of the plot."
+        )
+        st.download_button(
+            "⬇️ Download sensitivity summary as CSV",
+            data=df_sens.to_csv(index=False).encode('utf-8'),
+            file_name=f"msp_sensitivity_summary_{timestamp}.csv",
+            mime="text/csv",
+            type="primary",
+            use_container_width=True,
+            key="sens_summary_csv_dl",
+        )
+
+    # ---- Single-parameter sweep plot (only once finished) ------------------
+    if not running and not is_sens:
         successful = (df_results[df_results['error'] == '']
                       if 'error' in df_results.columns else df_results)
         if (len(sweep_values) == 1 and len(successful) >= 2 and
@@ -4893,7 +5802,8 @@ def _render_sweep(state):
                 except Exception:
                     pass
 
-        # Offer a clean slate for the next run.
+    # ---- Clean slate for the next run --------------------------------------
+    if not running:
         if st.button("🗑️ Clear saved progress for this configuration",
                      key="sweep_clear_btn"):
             try:
@@ -4901,7 +5811,8 @@ def _render_sweep(state):
                     os.remove(results_path)
             except Exception:
                 pass
-            st.session_state.pop('sweep_active', None)
+            st.session_state.pop('sens_active' if is_sens else 'sweep_active',
+                                 None)
             st.rerun()
 
     return running
@@ -4949,13 +5860,53 @@ elif sim_mode == "Parameter Sweep" and (run_sweep
                 time.sleep(1.5)
                 st.rerun()
 
+elif sim_mode == "Sensitivity Analysis" and (
+        run_sensitivity or st.session_state.get('sens_active')):
+    # ── Launch on button press (freezes ALL params at this instant) ───────
+    if run_sensitivity:
+        _base_params = _collect_base_params()
+        _combos = _build_sensitivity_runs(sens_specs)
+        # Bounds double as the config fingerprint used for resume-on-disk.
+        _sens_grid = {k: [s['low'], s['central'], s['high']]
+                      for k, s in sens_specs.items()}
+        _start_sweep(_sens_grid, _base_params, _combos, tea_mode,
+                     sens_summary_labels, mode='sensitivity',
+                     sens_specs=sens_specs, active_slot='sens_active')
+
+    _active_key = st.session_state.get('sens_active')
+    _state = st.session_state.get(_active_key) if _active_key else None
+
+    if _state is None:
+        st.info("No active sensitivity analysis. Tick the parameters to test "
+                "in the sidebar, set their bounds, then press **Run "
+                "Sensitivity Analysis**.")
+    else:
+        st.subheader(
+            f"\U0001F3AF Sensitivity Analysis — {_state['n_total']} run(s)")
+        _varied_list = ", ".join(
+            f"`{_state['labels'].get(k, k)}`" for k in _state['sweep_values'])
+        st.caption(f"Varying (one at a time): {_varied_list}")
+
+        if hasattr(st, "fragment") and _state['running']:
+            @st.fragment(run_every=2.0)
+            def _live_sens_panel():
+                if not _render_sweep(_state):
+                    st.rerun()
+            _live_sens_panel()
+        else:
+            _still_running = _render_sweep(_state)
+            if _still_running:
+                time.sleep(1.5)
+                st.rerun()
+
 else:
     # Welcome message
     st.info(
         "👈 Configure the parameters in the sidebar. Pick **Single Run** "
-        "for a full TEA report on one set of inputs, or **Parameter "
-        "Sweep** to vary one or more inputs and export the results as "
-        "a CSV."
+        "for a full TEA report on one set of inputs, **Parameter Sweep** "
+        "to vary one or more inputs over a grid, or **Sensitivity "
+        "Analysis** for a low/central/high tornado plot of the minimum "
+        "selling price."
     )
 
     st.markdown("""
@@ -4976,6 +5927,12 @@ else:
     - **Parameter sweep mode**: vary one or more inputs over a range
       (linear or log spacing), run them all, and download the combined
       results as a CSV with live progress and ETA
+    - **Sensitivity analysis mode**: pick the inputs you care about and run
+      each at a lower, central and upper value only (everything else held
+      central). Bounds come from a ± % of the central value or from
+      manually entered numbers. Outputs a tornado plot of the minimum
+      selling price plus CSVs of both the per-parameter summary and every
+      individual run
 
     **Instructions:**
     1. Select a feedstock from the dropdown
@@ -4987,6 +5944,9 @@ else:
        *Parameter Sweep:* tick the parameters to vary in the sweep
        section, set their ranges and #points, then click "Run Sweep"
        and download the CSV when finished.
+       *Sensitivity Analysis:* tick the parameters to test, choose ± %
+       or manual bounds for each, then click "Run Sensitivity Analysis"
+       to get the tornado plot and CSVs.
 
 any questions or queries, contact KHeeley@ucdavis.edu, refer to EXBYCost in the subject
     """)
