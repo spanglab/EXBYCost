@@ -1566,6 +1566,43 @@ feedstocks = {
         'moisture': 0.156667,
         'type': 'hulls'
     },
+    # ── Full-fat rice bran (hybrid literature composition) ───────────────
+    # Source: bran_fullfat_hybrid.csv. Values there are dry-basis mg/g and
+    # sum to 1000.1 mg/g; the 0.1 mg/g rounding excess is absorbed by the
+    # cellulose balance term, so 'comp' sums to exactly 1.0.
+    #
+    # Two sets of CSV rows share a proxy, and define_group() needs unique
+    # IDs, so each set is merged into a single term:
+    #   * "Cellulose (beta-1,4-glucan)" 71 mg/g + "Ash (K, Mg, Ca minerals)"
+    #     56 mg/g -> one Cellulose term (71 + 56 - 0.1 = 126.9 mg/g). Ash is
+    #     inorganic and has no thermo proxy; carrying it as cellulose keeps
+    #     the mass balance closed and matches the tool's "missing weight
+    #     assumed to be cellulose" convention.
+    #   * Albumin 50.3 + globulin 47.4 + glutelin 32.6 + prolamin 17.8
+    #     -> one prolamin term (148.1 mg/g). Prolamin is the only one of the
+    #     four storage-protein fractions the proxy finder resolves, so all
+    #     protein is carried on it.
+    'Rice bran (full-fat)': {
+        'chems': [
+            {'name': 'trilinolein',                                          'cas': '537-40-6',            'chebi': None},            # rice bran oil (TAG)
+            {'name': 'gamma-oryzanol',                                       'cas': '11042-64-1',          'chebi': None},
+            {'name': 'campesterol',                                          'cas': '474-62-4',            'chebi': 'CHEBI:28623'},   # total phytosterols
+            {'name': 'alpha-tocopherol',                                     'cas': '59-02-9',             'chebi': 'CHEBI:177086'},  # tocopherols + tocotrienols
+            {'name': 'squalene',                                             'cas': '111-02-4',            'chebi': 'CHEBI:15440'},
+            {'name': 'prolamin',                                             'cas': None,                  'chebi': None},            # albumin+globulin+glutelin+prolamin
+            {'name': 'amylose',                                              'cas': '9005-82-7',           'chebi': 'CHEBI:28102'},
+            {'name': 'amylopectin',                                          'cas': '9037-22-3',           'chebi': None},
+            {'name': 'phytic acid',                                          'cas': '83-86-3',             'chebi': 'CHEBI:17401'},
+            {'name': 'ferulic acid',                                         'cas': '1135-24-6',           'chebi': 'CHEBI:193350'},  # bound phenolics
+            {'name': 'sucrose',                                              'cas': '57-50-1',             'chebi': 'CHEBI:17992'},   # free sugars
+            {'name': 'hemicellulose',                                        'cas': '9034-32-6',           'chebi': 'CHEBI:61266'},   # arabinoxylan
+            {'name': 'lignin',                                               'cas': '9005-53-2',           'chebi': 'CHEBI:6457'},
+            {'name': 'Cellulose',                                            'cas': '9004-34-6',           'chebi': 'CHEBI:18246'},   # cellulose + ash, balance
+        ],
+        'comp': [0.160, 0.0042, 0.007, 0.0002, 0.0005, 0.1481, 0.051, 0.2323, 0.0585, 0.0023, 0.028, 0.140, 0.041, 0.1269],
+        'moisture': 0.10,   # PLACEHOLDER — not in the CSV; typical as-received full-fat rice bran is 8–12 wt%
+        'type': 'nuts, seeds and grains'
+    },
 }
 
 cepci_index = {
