@@ -1579,9 +1579,7 @@ feedstocks = {
     #     the mass balance closed and matches the tool's "missing weight
     #     assumed to be cellulose" convention.
     #   * Albumin 50.3 + globulin 47.4 + glutelin 32.6 + prolamin 17.8
-    #     -> one prolamin term (148.1 mg/g). Prolamin is the only one of the
-    #     four storage-protein fractions the proxy finder resolves, so all
-    #     protein is carried on it.
+    #     -> one protein term term (148.1 mg/g). 
     'Rice bran (full-fat)': {
         'chems': [
             {'name': 'trilinolein',                                          'cas': '537-40-6',            'chebi': None},            # rice bran oil (TAG)
@@ -1589,7 +1587,7 @@ feedstocks = {
             {'name': 'campesterol',                                          'cas': '474-62-4',            'chebi': 'CHEBI:28623'},   # total phytosterols
             {'name': 'alpha-tocopherol',                                     'cas': '59-02-9',             'chebi': 'CHEBI:177086'},  # tocopherols + tocotrienols
             {'name': 'squalene',                                             'cas': '111-02-4',            'chebi': 'CHEBI:15440'},
-            {'name': 'prolamin',                                             'cas': None,                  'chebi': None},            # albumin+globulin+glutelin+prolamin
+            {'name': 'protein',                                              'cas': None,                  'chebi': None},            # albumin+globulin+glutelin+prolamin
             {'name': 'amylose',                                              'cas': '9005-82-7',           'chebi': 'CHEBI:28102'},
             {'name': 'amylopectin',                                          'cas': '9037-22-3',           'chebi': None},
             {'name': 'phytic acid',                                          'cas': '83-86-3',             'chebi': 'CHEBI:17401'},
