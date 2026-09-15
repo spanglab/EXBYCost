@@ -1579,7 +1579,7 @@ feedstocks = {
     #     the mass balance closed and matches the tool's "missing weight
     #     assumed to be cellulose" convention.
     #   * Albumin 50.3 + globulin 47.4 + glutelin 32.6 + prolamin 17.8
-    #     -> one protein term term (148.1 mg/g). 
+    #     -> one protein term term (148.1 mg/g).
     'Rice bran (full-fat)': {
         'chems': [
             {'name': 'trilinolein',                                          'cas': '537-40-6',            'chebi': None},            # rice bran oil (TAG)
@@ -3994,31 +3994,91 @@ def _run_one_simulation(p, *, display=True):
                 # evap_guard_reasons above.
 
             _advance_progress()  # Stage 5: techno-economic analysis
-            #                       COUNT PROCESSING STEPS FOR LABOR CALCULATION
-            # Define which unit types involve solids
-            solid_handling_units = (units.ConveyingBelt, units.Shredder, SolidSolventExtractor, SolidCooler)
-            steps_involving_solids = 0
-            steps_not_involving_solids = 0
-            solid_units_list = []
-            non_solid_units_list = []
+            #                       ESTIMATE OPERATOR HEADCOUNT
+            # Operating labour is estimated with the Ulrich & Vasudevan
+            # per-equipment-item method (A Guide to Chemical Engineering
+            # Process Design and Economics, 1984/2004), Table 6-2. Each
+            # individual equipment item is assigned a fractional operator-
+            # per-shift load by its generic type, and these are summed across
+            # the flowsheet. Labour therefore scales with equipment count and
+            # degree of automation rather than an abstract "solids-handling
+            # step" classification -- which is why it does not over-count
+            # staffing for modern, automated solids handling the way the older
+            # Alkhayat & Gerrard step-counting correlation does.
+            #
+            # Ulrich (1984) Table 6-2: operators per unit per shift, by
+            # generic equipment type, mapped onto the actual unit classes
+            # built in this flowsheet. A unit type not covered here falls
+            # back to _ULRICH_DEFAULT. Mapping rationale:
+            #   FeedDrumDryer, SolventSprayDryer -> gas-solids contacting
+            #       equipment (0.1-0.3 range; midpoint used)
+            #   SolidCooler, units.HXutility      -> heat exchangers (0.1)
+            #   units.ConveyingBelt               -> conveyors (0.2)
+            #   Mill                              -> crushers/mills/grinders
+            #       (0.5-1 range; midpoint used)
+            #   bst.Mixer                         -> mixers (0.3)
+            #   units.Pump, bst.Splitter          -> negligible dedicated
+            #       attention, like pumps/drums in the table (0.0)
+            #   SolidSolventExtractor             -> reactors, as the
+            #       nearest analog to a multi-stage contacting vessel (0.5)
+            #   CorrectedMEE                      -> evaporators (0.3)
+            _ULRICH_DEFAULT = 0.2  # median of Ulrich Table 6-2 (also its
+            #                        most common value); used for any unit
+            #                        type not explicitly mapped below. Units
+            #                        that fall back to this are reported in a
+            #                        warning so they can be assigned properly.
+            ULRICH_OPERATORS_PER_UNIT = [
+                (FeedDrumDryer,         0.2),
+                (SolventSprayDryer,     0.2),
+                (SolidCooler,           0.1),
+                (units.ConveyingBelt,   0.2),
+                (Mill,                  0.75),
+                (bst.Mixer,             0.3),
+                (units.Pump,            0.0),
+                (bst.Splitter,          0.0),
+                (SolidSolventExtractor, 0.5),
+                (CorrectedMEE,          0.3),
+                (units.HXutility,       0.1),
+            ]
+
+            ulrich_operator_load = 0.0
+            ulrich_unit_breakdown = []
+            ulrich_default_units = []   # units that fell back to _ULRICH_DEFAULT
 
             for unit in sys.units:
-                # Skip storage tanks
+                # Storage tanks carry no dedicated operator load.
                 if isinstance(unit, units.StorageTank):
                     continue
-                # Check if unit handles solids
-                elif isinstance(unit, solid_handling_units):
-                    steps_involving_solids += 1
-                    solid_units_list.append(unit.ID)
-                else:
-                    steps_not_involving_solids += 1
-                    non_solid_units_list.append(unit.ID)
 
-            # Calculate operators per shift using the formula:
-            # The correlation is still evaluated even when overridden, so the
-            # estimate stays available for comparison in the results.
-            operators_per_shift_est = round(
-                (6.29 + 31.7 * (steps_involving_solids) + 0.23 * (steps_not_involving_solids)) ** 0.5)
+                # Match each unit to its Ulrich per-item load. First matching
+                # class in the list wins, so more specific subclasses can be
+                # listed ahead of general ones if needed.
+                _load = _ULRICH_DEFAULT
+                _matched = False
+                for _cls, _val in ULRICH_OPERATORS_PER_UNIT:
+                    if isinstance(unit, _cls):
+                        _load = _val
+                        _matched = True
+                        break
+                ulrich_operator_load += _load
+                ulrich_unit_breakdown.append(
+                    {'unit': unit.ID, 'type': type(unit).__name__,
+                     'operators_per_shift': _load,
+                     'used_default': not _matched})
+                if not _matched:
+                    ulrich_default_units.append(
+                        {'unit': unit.ID, 'type': type(unit).__name__})
+
+            # Operator headcount -- Ulrich & Vasudevan Table 6-2, summed
+            # then rounded UP: a fractional shift position still needs a
+            # whole person on duty. (int(x) + (x > int(x)) is an integer
+            # ceiling that avoids referencing the module-level _math, which
+            # is shadowed by a local `import math as _math` later in this
+            # function and so cannot be read here.)
+            _ulrich_int = int(ulrich_operator_load)
+            operators_per_shift_est = max(
+                1, _ulrich_int + (1 if ulrich_operator_load > _ulrich_int else 0))
+
             _ops_override = p.get('operators_per_shift')
             operators_per_shift = (int(_ops_override)
                                    if _ops_override is not None
@@ -4280,6 +4340,10 @@ def _run_one_simulation(p, *, display=True):
                 'labor_cost_USD_per_yr':    labor_cost_val,
                 'operators_per_shift':      operators_per_shift,
                 'operators_per_shift_estimated': operators_per_shift_est,
+                'ulrich_operator_load_raw': ulrich_operator_load,
+                'ulrich_units_using_default': len(ulrich_default_units),
+                'ulrich_default_unit_ids': "; ".join(
+                    d['unit'] for d in ulrich_default_units),
                 'operators_per_shift_overridden': _ops_override is not None,
                 'solv_price_USD_per_kg':    solv_price,
                 'solv_price_overridden':    _solv_price_override is not None,
@@ -4824,6 +4888,33 @@ def _run_one_simulation(p, *, display=True):
 
             with tab3:
                 st.subheader("🔄 Annual Operating Costs")
+
+                with st.expander("👷 Operator headcount (Ulrich method)", expanded=False):
+                    _headcount_label = (
+                        "Custom (user-entered)" if _ops_override is not None
+                        else "Ulrich & Vasudevan, Table 6-2 (per-equipment-item)")
+                    st.metric(
+                        "Operators/shift used for costing",
+                        operators_per_shift,
+                        help=f"{_headcount_label}. Raw summed Ulrich load "
+                             f"{ulrich_operator_load:.2f}, rounded up to a "
+                             f"whole shift position.")
+                    st.caption(
+                        f"{len(ulrich_unit_breakdown)} equipment item(s) in "
+                        f"the Ulrich sum (storage tanks excluded).")
+                    st.dataframe(pd.DataFrame(ulrich_unit_breakdown),
+                                 use_container_width=True, hide_index=True)
+                    if ulrich_default_units:
+                        _dft = ", ".join(
+                            f"{d['unit']} ({d['type']})"
+                            for d in ulrich_default_units)
+                        st.warning(
+                            f"⚠️ {len(ulrich_default_units)} unit(s) had no "
+                            f"explicit Ulrich mapping and used the default "
+                            f"of {_ULRICH_DEFAULT} operators/shift (the median "
+                            f"of Table 6-2): {_dft}. Assign these a specific "
+                            f"value in ULRICH_OPERATORS_PER_UNIT for a more "
+                            f"accurate estimate.")
 
                 # Calculate operating costs
                 maintenance_cost = tea.maintenance * fci
