@@ -66,6 +66,27 @@ def suggest_pressures(solvent_ID, n_effects=3, T_high_C=None, delta_T_C=20,
     return tuple(round(p) for p in pressures)
 
 
+class _FeedFlashHeatUtility(bst.HeatUtility):
+    """Heat utility for evaporator effect 1.
+
+    If the feed arrives hotter than effect 1, it flashes down to the effect
+    temperature as it enters, so the steam only ever heats at the effect
+    temperature. BioSTEAM's pinch check would otherwise reject that case
+    ("inlet must be cooler than outlet if heating"). For heating duties,
+    the inlet temperature is therefore taken as min(T_feed, T_effect).
+    """
+    def __call__(self, unit_duty, T_in, T_out=None, agent=None):
+        if unit_duty > 0 and T_out is not None and T_in > T_out:
+            owner = getattr(self, '_owner', None)
+            if owner is not None:
+                owner._note_guard(
+                    'feed hotter than effect 1 (flashes on entry)',
+                    ValueError(f"T_feed {T_in - 273.15:.2f} C > "
+                               f"T_effect1 {T_out - 273.15:.2f} C"))
+            T_in = T_out
+        return super().__call__(unit_duty, T_in, T_out, agent)
+
+
 class CorrectedMEE(bst.MultiEffectEvaporator):
     """
     MultiEffectEvaporator with corrected flash=True output assignment.
@@ -162,6 +183,13 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
             return abs(m_in - m_out) / m_in
         except Exception:
             return None
+
+    def create_heat_utility(self, agent=None, heat_transfer_efficiency=None):
+        """Use a heat utility that treats a hot feed as flashing on entry."""
+        hu = _FeedFlashHeatUtility(heat_transfer_efficiency, None)
+        hu._owner = self
+        self.heat_utilities.append(hu)
+        return hu
 
     # ---- Design ------------------------------------------------------------
     def _design(self):
