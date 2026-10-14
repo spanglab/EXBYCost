@@ -379,7 +379,12 @@ def calculate_hsp_solubility_extraction(compound_name: str, solvent_name: str,
             'success': True,
             'error': None,
             'chi': result.get('chi', None),
-            'Ra': result.get('Ra', None)
+            'Ra': result.get('Ra', None),
+            # Solid-liquid vs liquid-liquid limit (compounds only)
+            'limiting': result.get('limiting', 'LLE'),
+            'phi_SLE': result.get('phi_SLE', None),
+            'phi_LLE': result.get('phi_LLE', result.get('phi_polymer', None)),
+            'fusion_source': result.get('fusion_source', None),
         }
 
     except Exception as e:
@@ -734,8 +739,15 @@ class SolidSolventExtractor(Unit):
 
     The unit is designed and costed as a combination of:
 
-    1. **Stirred Mixing Tank** - for extraction contact and equilibrium
-    2. **Solids Centrifuge** - for final solid-liquid separation
+    1. **N_stages CSTRs in series** (default 5) - for extraction contact,
+       each sized for 1/N_stages of the total residence time
+    2. **Solids Centrifuge** - one unit at the end of the train for final
+       solid-liquid separation
+
+    **Unextracted bypass:** a fixed ``bypass_fraction`` (default 6%) of the
+    solid feed is never extracted and leaves directly in the residual. The
+    residual stream is the sum of that untouched material and the residual
+    from processing the other (1 - bypass_fraction) of the feed.
 
     **Equilibrium Models:**
 
@@ -768,9 +780,19 @@ class SolidSolventExtractor(Unit):
         [0] Solid/residual stream
         [1] Extract stream (solvent-rich with dissolved compounds)
     tau : float, optional
-        Residence time in the mixing tank (hours). Default is 2 hours.
+        TOTAL residence time across the CSTR train (hours). Each of the
+        ``N_stages`` CSTRs is sized for tau / N_stages. Default is 2 hours.
     V : float, optional
-        Vessel volume in m³. If specified, overrides tau.
+        TOTAL vessel volume of the CSTR train in m³ (split equally over
+        the stages). If specified, overrides tau.
+    N_stages : int, optional
+        Number of equal-volume CSTRs in series ahead of the centrifuge.
+        Default is 5.
+    bypass_fraction : float, optional
+        Fraction of the solid feed (ins[0]) that passes through the unit
+        without being extracted and leaves unchanged in the residual
+        stream. The remaining (1 - bypass_fraction) goes through the full
+        SLE/LLE/kinetics calculation. Default is 0.06 (6%).
     solvent_ID : str, optional
         Chemical ID of the solvent. If not specified, will use dominant
         component in the solvent feed stream.
@@ -793,6 +815,14 @@ class SolidSolventExtractor(Unit):
         Convergence tolerance for SLE. Default is 0.001.
     lle_attempts : int, optional
         Number of LLE consensus attempts. Default is 3.
+    cake_liquid_content : float, optional
+        Mass fraction of liquid in the centrifuge cake (residual stream).
+        Extract (solvent plus dissolved compounds, at the extract's
+        composition) is moved into the residual until the cake reaches this
+        liquid content. Liquids already in the residual (e.g. unextracted
+        feed water) count toward it. Set to 0 or None for an ideal
+        (perfectly dry) separation. Default is 0.40, consistent with
+        BioSTEAM's SolidsCentrifuge default moisture content.
     verbose : bool, optional
         If True, print detailed separation progress. Default is False.
 
@@ -806,6 +836,12 @@ class SolidSolventExtractor(Unit):
         Equilibrium amounts before kinetics correction
     hsp_results : dict
         Dictionary containing HSP solubility results for non-UNIFAC compounds
+    cake_dry_solids, cake_liquid : float
+        Dry solids and liquid in the residual stream (kg/hr)
+    cake_liquid_fraction : float
+        Achieved liquid mass fraction of the cake
+    entrained_extract : float
+        Extract carried into the cake by the centrifuge (kg/hr)
 
     Notes
     -----
@@ -820,12 +856,18 @@ class SolidSolventExtractor(Unit):
     Compounds are automatically routed to HSP-based solubility prediction if
     they lack UNIFAC group definitions. The method distinguishes between:
     - Polymers (cellulose, lignin, etc.): Uses Flory-Huggins with N>>1
-    - Small molecules: Uses Flory-Huggins with N=1
+    - Small molecules: Uses Flory-Huggins with N=1. Solubility is the lower of
+      the liquid-liquid limit (binodal) and the solid-liquid limit from the
+      heat of fusion and melting point, both estimated from structure with
+      the Van Krevelen group contributions.
 
     **Cost Basis:**
 
+    All extractor correlations below are applied PER CSTR (sized on that
+    stage's volume or power) and multiplied by N_stages.
+
     - **Mixing Tank (conventional):** Based on Apostolakou et al. (2009)
-        - Base cost: $12,080 at 10 m³
+        - Base cost: $12,080 at 10 m³ (per CSTR)
         - Scaling exponent: 0.525
         - Bare module: 2.5
 
@@ -846,10 +888,12 @@ class SolidSolventExtractor(Unit):
 
     **Power Requirements:**
 
-    - Conventional tank agitation: 0.5 kW per m³ of vessel volume
-    - UAE: 1.625 kW per L/min of total flow
-    - MAE: 12.5 kW per L/min of total flow
-    - Centrifuge: 1.4 kW per m³/hr of throughput
+    - Conventional tank agitation: 0.5 kW per m³ of each CSTR's volume
+    - UAE: 1.625 kW per L/min of total flow, split equally across the
+      N_stages CSTRs (total power is the same as a single unit; the
+      correlation is an energy dose per unit throughput)
+    - MAE: 12.5 kW per L/min of total flow, split equally as for UAE
+    - Centrifuge: 1.4 kW per m³/hr of throughput (single unit)
 
     Examples
     --------
@@ -880,6 +924,11 @@ class SolidSolventExtractor(Unit):
     _N_outs = 2
     _units = {'Volume': 'm^3',
               'Residence time': 'hr',
+              'Number of CSTRs': '',
+              'Volume per CSTR': 'm^3',
+              'Residence time per CSTR': 'hr',
+              'Extractor power per CSTR': 'kW',
+              'Bypass fraction': '',
               'Solids loading': 'ton/hr',
               'Extractor power': 'kW',
               'Tank power': 'kW',
@@ -900,6 +949,8 @@ class SolidSolventExtractor(Unit):
     def __init__(self, ID='', ins=None, outs=(), thermo=None,
                  tau=2.0,
                  V=None,
+                 N_stages=5,
+                 bypass_fraction=0.06,
                  solvent_ID=None,
                  reactor_type='conventional',
                  particle_radius=0.254,
@@ -907,12 +958,15 @@ class SolidSolventExtractor(Unit):
                  sle_max_iter=20,
                  sle_tol=0.001,
                  lle_attempts=3,
+                 cake_liquid_content=0.40,
                  verbose=False):
 
         Unit.__init__(self, ID, ins, outs, thermo)
 
         self.tau = tau
         self.V = V
+        self.N_stages = N_stages
+        self.bypass_fraction = bypass_fraction
         self.solvent_ID = solvent_ID
         self.reactor_type = reactor_type
         self.particle_radius = particle_radius
@@ -920,6 +974,7 @@ class SolidSolventExtractor(Unit):
         self.sle_max_iter = sle_max_iter
         self.sle_tol = sle_tol
         self.lle_attempts = lle_attempts
+        self.cake_liquid_content = cake_liquid_content
         self.verbose = verbose
 
         # Results storage
@@ -927,6 +982,10 @@ class SolidSolventExtractor(Unit):
         self.extraction_fractions = {}
         self.equilibrium_amounts = {}
         self.hsp_results = {}  # Store HSP solubility results for non-UNIFAC compounds
+        self.cake_dry_solids = 0.0
+        self.cake_liquid = 0.0
+        self.cake_liquid_fraction = 0.0
+        self.entrained_extract = 0.0
 
     @property
     def reactor_type(self):
@@ -1105,10 +1164,23 @@ class SolidSolventExtractor(Unit):
 
         P = solvent_stream.P
 
-        # Calculate mixing temperature
+        # ------------------------------------------------------------------
+        # Unextracted bypass: a fixed fraction of the solid feed is never
+        # contacted/extracted and leaves unchanged in the residual. Only the
+        # remaining `process_frac` of the feed goes through SLE/LLE/kinetics.
+        # The bypass is added back to the residual stream at the end of _run.
+        # ------------------------------------------------------------------
+        bypass_frac = float(self.bypass_fraction or 0.0)
+        if not 0.0 <= bypass_frac < 1.0:
+            raise ValueError(
+                f"bypass_fraction must be in [0, 1); got {self.bypass_fraction}")
+        process_frac = 1.0 - bypass_frac
+        bypass_mol = feed.mol.copy() * bypass_frac   # untouched material
+
+        # Calculate mixing temperature (processed portion of feed + solvent)
         feed_Cp = 0
         for chem_id in feed.chemicals.IDs:
-            mol_flow = feed.imol[chem_id]
+            mol_flow = feed.imol[chem_id] * process_frac
             if mol_flow > 1e-10:
                 chem = self.chemicals[chem_id]
                 try:
@@ -1139,8 +1211,9 @@ class SolidSolventExtractor(Unit):
         if feed_Cp > 0 and solvent_Cp > 0:
             T = (feed.T * feed_Cp + solvent_stream.T * solvent_Cp) / (feed_Cp + solvent_Cp)
         else:
-            T = (feed.T * feed.F_mass + solvent_stream.T * solvent_stream.F_mass) / (
-                        feed.F_mass + solvent_stream.F_mass)
+            _F_feed = feed.F_mass * process_frac
+            T = (feed.T * _F_feed + solvent_stream.T * solvent_stream.F_mass) / (
+                        _F_feed + solvent_stream.F_mass)
 
         if self.solvent_ID is None:
             self.solvent_ID = solvent_stream.get_main_chemical()
@@ -1154,7 +1227,7 @@ class SolidSolventExtractor(Unit):
         feed_dict = {}
 
         for chem in feed.chemicals.IDs:
-            amount = feed.imol[chem]
+            amount = feed.imol[chem] * process_frac   # bypass excluded
             if amount > 1e-10:
                 feed_dict[chem] = feed_dict.get(chem, 0) + amount
 
@@ -1249,7 +1322,9 @@ class SolidSolventExtractor(Unit):
                 if self.verbose:
                     if hsp_result['success']:
                         print(f"  {compound_name} ({hsp_result['method']}):")
-                        print(f"    Solubility: {hsp_result['solubility_g_L']:.2f} g/L")
+                        print(f"    Solubility: {hsp_result['solubility_g_L']:.2f} g/L "
+                              f"(limit: {hsp_result.get('limiting', 'LLE')}, "
+                              f"fusion data: {hsp_result.get('fusion_source')})")
                         print(f"    Dissolved: {hsp_result['dissolved_mol']:.4f} mol")
                         print(f"    Solid: {hsp_result['solid_mol']:.4f} mol")
                     else:
@@ -1375,11 +1450,10 @@ class SolidSolventExtractor(Unit):
                     solid_amounts[compound] += unextracted
                 else:
                     solid_amounts[compound] = unextracted
-
-                if compound in residual_composition:
-                    residual_composition[compound] += unextracted
-                else:
-                    residual_composition[compound] = unextracted
+                # NOTE: unextracted material is recorded ONLY in solid_amounts.
+                # (Previously it was also added to residual_composition, and the
+                # output loop then skipped residual_composition for any compound
+                # already in solid_amounts, which silently dropped LLE residuals.)
 
             if self.verbose:
                 frac = kinetics_data['extraction_fraction']
@@ -1415,13 +1489,21 @@ class SolidSolventExtractor(Unit):
         solid_out.P = P
         solid_out.imol.data[:] = 0
 
+        # solid_amounts (undissolved + kinetically unextracted) and
+        # residual_composition (LLE residual) are distinct portions, so both
+        # are added in full.
         for compound, amount in solid_amounts.items():
             if amount > 1e-10:
-                solid_out.imol[compound] = amount
+                solid_out.imol[compound] += amount
 
         for compound, amount in residual_composition.items():
-            if amount > 1e-10 and compound not in solid_amounts:
+            if amount > 1e-10:
                 solid_out.imol[compound] += amount
+
+        # Residual = residual from the processed (1 - bypass) fraction
+        #          + the untouched bypass fraction of the feed.
+        solid_out.mol[:] += bypass_mol
+        self.bypass_mol = bypass_mol
 
         extract_out.phase = 'l'
         extract_out.T = T
@@ -1432,12 +1514,86 @@ class SolidSolventExtractor(Unit):
             if amount > 1e-10:
                 extract_out.imol[compound] = amount
 
-    # Cost correlation parameters for each reactor type
-    # For conventional: mixing tank scaled on Volume (m³)
-    # For UAE/MAE: extractor equipment scaled on power (kW)
+        # ======================================================================
+        # CENTRIFUGE: LIQUID RETAINED IN THE CAKE
+        # ======================================================================
+        self._apply_cake_liquid_retention(solid_out, extract_out, T, solvent)
+
+    def _is_liquid_in_cake(self, chem_ID, T, solvent):
+        """True if a component counts as cake liquid (solvent, or liquid at T)."""
+        if chem_ID == solvent:
+            return True
+        chem = self.chemicals[chem_ID]
+        Tm = getattr(chem, 'Tm', None)
+        Tb = getattr(chem, 'Tb', None)
+        return bool(Tm and Tb and Tm < T < Tb)
+
+    def _apply_cake_liquid_retention(self, solid_out, extract_out, T, solvent):
+        """
+        Entrain extract into the centrifuge cake so that the cake is
+        ``cake_liquid_content`` (mass fraction) liquid.
+
+        Cake "liquid" is the retained solution: the entrained extract
+        (including its dissolved solutes) plus any component of the residual
+        that is liquid at T (e.g. unextracted feed water). Everything else in
+        the residual is dry solids.
+        The entrained liquid has the extract's composition (solvent plus
+        dissolved product), as in a real centrifuge cake. If the residual is
+        already at or above the target liquid content, nothing is moved.
+        """
+        mc = self.cake_liquid_content
+        self.entrained_extract = 0.0
+        IDs = self.chemicals.IDs
+        is_liq = np.array([self._is_liquid_in_cake(i, T, solvent) for i in IDs])
+        cake_mass = solid_out.mass
+        dry = float(cake_mass[~is_liq].sum())
+        liquid = float(cake_mass[is_liq].sum())
+
+        if mc and dry > 0:
+            if not 0.0 <= mc < 1.0:
+                raise ValueError(
+                    f"cake_liquid_content must be in [0, 1); got {mc}")
+            target_liquid = dry * mc / (1.0 - mc)
+            needed = target_liquid - liquid
+            F_extract = extract_out.F_mass
+            if needed > 0 and F_extract > 0:
+                frac = min(needed / F_extract, 1.0)
+                entrained = extract_out.mol * frac
+                extract_out.mol[:] -= entrained
+                solid_out.mol[:] += entrained
+                self.entrained_extract = frac * F_extract
+                if frac == 1.0 and self.verbose:
+                    print("⚠️  Not enough extract to reach the cake liquid "
+                          "content; all extract left with the cake.")
+            elif needed < 0 and self.verbose:
+                print(f"Cake is already {liquid / (liquid + dry):.1%} liquid "
+                      f"(target {mc:.0%}); no extract entrained.")
+
+        # Retained solution (entrained extract, including its dissolved
+        # solutes) counts as cake liquid; dry solids are the residual's
+        # non-liquid components before entrainment.
+        self.cake_dry_solids = dry
+        self.cake_liquid = liquid + self.entrained_extract
+        total = self.cake_dry_solids + self.cake_liquid
+        self.cake_liquid_fraction = self.cake_liquid / total if total else 0.0
+
+        if self.verbose:
+            print("\n" + "=" * 80)
+            print("CENTRIFUGE CAKE")
+            print("=" * 80)
+            print(f"Dry solids:        {self.cake_dry_solids:.3f} kg/hr")
+            print(f"Liquid in cake:    {self.cake_liquid:.3f} kg/hr "
+                  f"({self.cake_liquid_fraction:.1%})")
+            print(f"Extract entrained: {self.entrained_extract:.3f} kg/hr")
+
+    # Cost correlation parameters for each reactor type.
+    # These are applied PER CSTR (to that stage's volume or power) and the
+    # result is multiplied by N_stages.
+    # For conventional: mixing tank scaled on Volume per CSTR (m³)
+    # For UAE/MAE: extractor equipment scaled on power per CSTR (kW)
     EXTRACTOR_COST_PARAMS = {
         'conventional': {
-            'basis': 'Volume',
+            'basis': 'Volume per CSTR',
             'units': 'm^3',
             'cost': 12080,
             'CE': 525.4,
@@ -1446,7 +1602,7 @@ class SolidSolventExtractor(Unit):
             'S': 10,
         },
         'ultrasound': {
-            'basis': 'Extractor power',
+            'basis': 'Extractor power per CSTR',
             'units': 'kW',
             'cost': 68800,
             'CE': 798.88,
@@ -1455,7 +1611,7 @@ class SolidSolventExtractor(Unit):
             'S': 3.6,
         },
         'microwave': {
-            'basis': 'Extractor power',
+            'basis': 'Extractor power per CSTR',
             'units': 'kW',
             'cost': 180000,
             'CE': 596.2,
@@ -1466,51 +1622,73 @@ class SolidSolventExtractor(Unit):
     }
 
     def _design(self):
-        """Design the extractor vessel and centrifuge."""
+        """Design the CSTR train (N_stages equal CSTRs) and the centrifuge."""
         Design = self.design_results
 
         feed, solvent = self.ins
         solid_out, extract_out = self.outs
 
+        N = int(self.N_stages)
+        if N < 1:
+            raise ValueError(f"N_stages must be >= 1; got {self.N_stages}")
+
+        # Every CSTR in series carries the full flow. The bypassed fraction
+        # still physically passes through the vessels (it just isn't
+        # extracted), so the equipment is sized on the full throughput.
         Q_feed = feed.F_vol
         Q_solvent = solvent.F_vol
         Q_total = Q_feed + Q_solvent
 
         if self.V is None:
-            V = Q_total * self.tau
+            V = Q_total * self.tau          # total train volume
         else:
             V = self.V
             self.tau = V / Q_total if Q_total > 0 else 0
 
         V = max(V, 0.1)
+        V_stage = V / N                     # each CSTR: tau / N residence time
+        tau_stage = self.tau / N
 
+        Design['Number of CSTRs'] = N
         Design['Volume'] = V
+        Design['Volume per CSTR'] = V_stage
         Design['Residence time'] = self.tau
+        Design['Residence time per CSTR'] = tau_stage
+        Design['Bypass fraction'] = self.bypass_fraction
 
-        solids_mass_flow = solid_out.F_mass
+        # Centrifuge is sized on DRY solids (as in BioSTEAM's SolidsCentrifuge),
+        # not on the wet cake, so the retained liquid does not inflate cost.
+        solids_mass_flow = self.cake_dry_solids
         solids_loading = solids_mass_flow / 1000
         solids_loading = max(solids_loading, 0.1)
 
         Design['Solids loading'] = solids_loading
 
-        # Power calculations depend on reactor type
+        # Single centrifuge at the end of the train (unchanged)
         centrifuge_power = Q_total * 1.40
 
+        # Extractor power is evaluated per CSTR, then multiplied by N
+        Q_total_l_min = Q_total * 1000 / 60  # m³/hr -> L/min
         if self._reactor_type == 'conventional':
-            # Standard stirred tank: 0.5 kW per m³
-            tank_power = V * 0.5
-            Design['Extractor power'] = 0  # Not used for costing
+            # Stirred tank agitation: 0.5 kW per m³ of each CSTR
+            stage_power = V_stage * 0.5
+            Design['Extractor power per CSTR'] = 0  # not used for costing
+            Design['Extractor power'] = 0
         elif self._reactor_type == 'ultrasound':
-            # UAE power: 1.625 kW per L/min of total flow
-            Q_total_l_min = Q_total * 1000 / 60  # m³/hr -> L/min
-            tank_power = 1.625 * Q_total_l_min
-            Design['Extractor power'] = tank_power
+            # UAE: 1.625 kW per L/min of total flow is a specific energy dose
+            # (~97.5 J/mL) delivered once over the whole residence time, so
+            # it is split equally across the N stages (total = single unit).
+            stage_power = 1.625 * Q_total_l_min / N
+            Design['Extractor power per CSTR'] = stage_power
+            Design['Extractor power'] = stage_power * N
         elif self._reactor_type == 'microwave':
-            # MAE power: 12.5 kW per L/min of total flow
-            Q_total_l_min = Q_total * 1000 / 60  # m³/hr -> L/min
-            tank_power = 12.5 * Q_total_l_min
-            Design['Extractor power'] = tank_power
+            # MAE: 12.5 kW per L/min of total flow, split equally across the
+            # N stages for the same reason (total = single unit).
+            stage_power = 12.5 * Q_total_l_min / N
+            Design['Extractor power per CSTR'] = stage_power
+            Design['Extractor power'] = stage_power * N
 
+        tank_power = stage_power * N
         total_power = tank_power + centrifuge_power
         Design['Tank power'] = tank_power
         Design['Centrifuge power'] = centrifuge_power
@@ -1521,45 +1699,52 @@ class SolidSolventExtractor(Unit):
     def _cost(self):
         """Calculate equipment costs based on reactor type.
 
-        The centrifuge cost is handled by the @cost decorator.
-        The extractor/tank cost is calculated here based on reactor type.
+        The centrifuge cost (single unit) is handled by the @cost decorator.
+        The extractor cost is one CSTR costed on its own size, times N_stages.
         """
+        N = int(self.N_stages)
         # Determine equipment name and register bare-module factor
         # before any cost assignments to avoid BioSTEAM warnings
         if self._reactor_type == 'conventional':
-            equip_name = 'Mixing tank'
+            equip_name = f'Mixing tanks ({N} CSTRs)'
         elif self._reactor_type == 'ultrasound':
-            equip_name = 'Ultrasound extractor'
+            equip_name = f'Ultrasound extractors ({N} CSTRs)'
         elif self._reactor_type == 'microwave':
-            equip_name = 'Microwave extractor'
+            equip_name = f'Microwave extractors ({N} CSTRs)'
 
         params = self.EXTRACTOR_COST_PARAMS[self._reactor_type]
-        self.F_BM[equip_name] = 2.5
+        self.F_BM[equip_name] = params['BM']
 
-        # Let the @cost decorator handle the centrifuge
-        super()._cost()
+        # Centrifuge from the @cost decorator. NOTE: because this class
+        # defines its own _cost, BioSTEAM does not install the decorated cost
+        # as _cost, and super()._cost() is the no-op Unit._cost -- so the
+        # centrifuge must be evaluated explicitly via _decorated_cost().
+        self._decorated_cost()
 
-        # Now add the extractor/tank cost
         Design = self.design_results
 
-        # Get the design value for costing basis
+        # Per-CSTR design value for the costing basis
         design_value = Design[params['basis']]
         design_value = max(design_value, 1e-6)  # Avoid zero division
 
-        # Scale the reference cost: C = C_ref * (S / S_ref)^n
+        # Scale the reference cost for ONE CSTR: C = C_ref * (S / S_ref)^n
         S_ref = params['S']
         C_ref = params['cost']
         n = params['n']
+        cost_per_stage = C_ref * (design_value / S_ref) ** n
 
-        scaled_cost = C_ref * (design_value / S_ref) ** n
+        # N identical CSTRs
+        scaled_cost = cost_per_stage * N
 
         # Adjust for CEPCI
         current_CE = bst.CE
         ref_CE = params['CE']
         adjusted_cost = scaled_cost * (current_CE / ref_CE)
 
-        self.baseline_purchase_costs[equip_name] = scaled_cost
-        self.purchase_costs[equip_name] = adjusted_cost
+        # BioSTEAM rebuilds purchase_costs from baseline_purchase_costs after
+        # _cost (baseline x F_D x F_P x F_M), so the CEPCI-adjusted value must
+        # go in the baseline or the adjustment is silently lost.
+        self.baseline_purchase_costs[equip_name] = adjusted_cost
 
 
 # =============================================================================
@@ -1597,7 +1782,7 @@ if __name__ == "__main__":
                       glucose=20,
                       citric_acid=15,
                       palmitic_acid=5,
-                      beta_carotene=8,
+                      **{'beta-carotene': 8},
                       water=10,
                       T=323.15,
                       units='kg/hr')
@@ -1654,7 +1839,7 @@ if __name__ == "__main__":
     residence_times = [0.5, 1.0, 2.0, 4.0, 8.0]
 
     print(f"\n{'Residence Time (hr)':<20}", end='')
-    for chem in ['lycopene', 'glucose', 'beta_carotene']:
+    for chem in ['lycopene', 'glucose', 'beta-carotene']:
         print(f"{chem + ' (%)':<15}", end='')
     print()
     print("-" * 65)
@@ -1671,7 +1856,7 @@ if __name__ == "__main__":
         E_test.simulate()
 
         print(f"{tau:<20.1f}", end='')
-        for chem in ['lycopene', 'glucose', 'beta_carotene']:
+        for chem in ['lycopene', 'glucose', 'beta-carotene']:
             frac = E_test.extraction_fractions.get(chem, 0) * 100
             print(f"{frac:<15.1f}", end='')
         print()
@@ -1683,7 +1868,7 @@ if __name__ == "__main__":
     reactor_types = ['conventional', 'ultrasound', 'microwave']
 
     print(f"\n{'Reactor Type':<20}{'Factor':<10}", end='')
-    for chem in ['lycopene', 'glucose', 'beta_carotene']:
+    for chem in ['lycopene', 'glucose', 'beta-carotene']:
         print(f"{chem + ' (%)':<15}", end='')
     print()
     print("-" * 75)
@@ -1701,7 +1886,7 @@ if __name__ == "__main__":
         E_reactor.simulate()
 
         print(f"{reactor:<20}{E_reactor.accessibility_factor:<10.2f}", end='')
-        for chem in ['lycopene', 'glucose', 'beta_carotene']:
+        for chem in ['lycopene', 'glucose', 'beta-carotene']:
             frac = E_reactor.extraction_fractions.get(chem, 0) * 100
             print(f"{frac:<15.1f}", end='')
         print()
