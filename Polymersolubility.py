@@ -39,8 +39,16 @@ Plant Polymer Data:
   DOI:10.1007/b136816 (Hemicellulose structure and properties)
 - Lindman, B. et al. (2010). Langmuir 26(8), 5251-5259. (Cellulose solubility)
 - Medronho, B. et al. (2012). Cellulose 19, 581-587. (Cellulose dissolution)
+
+Solid-Liquid Equilibrium (crystalline small molecules):
+- Prausnitz, J.M., Lichtenthaler, R.N., de Azevedo, E.G. (1999). Molecular
+  Thermodynamics of Fluid-Phase Equilibria, 3rd Ed. Prentice Hall.
+  (ln a = -(dHfus/R)(1/T - 1/Tm))
+- Van Krevelen (2009), Tables 5.7 (Hm) and 6.8 (Ym): Tm and Hfus estimated
+  from structure (GROUP_CONTRIBUTIONS)
 """
 import numpy as np
+from scipy.optimize import brentq
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, List
 import urllib.request
@@ -308,6 +316,8 @@ class PolymerData:
     density_source: str
     N: float = 368  # Degree of polymerization (default: median of biopolymer literature values)
     N_source: str = 'default_median_biopolymer'
+    MW: Optional[float] = None      # g/mol (small molecules; used for SLE size ratio r)
+    smiles: Optional[str] = None    # used for Van Krevelen Tm/Hfus estimation
 
 
 # =============================================================================
@@ -923,6 +933,82 @@ def find_equilibrium_phi(chi: float, N: float) -> Tuple[float, str]:
 
 
 # =============================================================================
+# SOLID-LIQUID EQUILIBRIUM (HEAT OF FUSION) LIMIT
+# =============================================================================
+
+def estimate_fusion_properties(smiles: Optional[str]) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Estimate melting point (K) and heat of fusion (J/mol) from structure
+    using the Van Krevelen group contributions (GROUP_CONTRIBUTIONS):
+
+        Tm    = sum(Ym_i) / M          (Table 6.8, Ym in K·g/mol)
+        dHfus = sum(Hm_i)              (Table 5.7, Hm in kJ/mol)
+
+    Returns (Tm, Hfus, source); (None, None, reason) if not possible.
+    """
+    if not smiles or not RDKIT_AVAILABLE:
+        return None, None, 'no_smiles'
+    mol = Chem.MolFromSmiles(smiles)
+    groups = _match_smarts_groups(smiles)
+    if mol is None or not groups:
+        return None, None, 'no_groups_matched'
+
+    M = Descriptors.MolWt(mol)
+    sum_Ym = sum(GROUP_CONTRIBUTIONS[g]['Ym'] * n for g, n in groups.items()
+                 if g in GROUP_CONTRIBUTIONS)
+    sum_Hm = sum(GROUP_CONTRIBUTIONS[g]['Hm'] * n for g, n in groups.items()
+                 if g in GROUP_CONTRIBUTIONS)
+
+    Tm = sum_Ym / M if M > 0 else None
+    Hfus = sum_Hm * 1000.0  # kJ/mol -> J/mol
+    if Tm is None or Tm <= 0 or Hfus <= 0:
+        return None, None, 'VanKrevelen_invalid'
+    return Tm, Hfus, 'estimated_VanKrevelen2009'
+
+
+def calculate_sle_phi(chi: float, r: float, T: float,
+                      Tm: Optional[float], Hfus: Optional[float]) -> float:
+    """
+    Solid-liquid solubility limit as a solute volume fraction.
+
+    At saturation the solute activity equals that of the pure solid:
+
+        ln a = -(Hfus/R)(1/T - 1/Tm)                                 (eq. 6)
+
+    with the Flory-Huggins solute activity:
+
+        ln a = ln(phi) + (1 - r)(1 - phi) + r*chi*(1 - phi)^2        (eq. 7)
+
+    where r = V_solute / V_solvent (eq. 8) and chi is on the solvent molar
+    volume (calculate_chi). The lowest root (from the dilute side) is taken,
+    since for large chi the FH activity is non-monotonic.
+
+    Returns 1.0 (no solid limit) if T >= Tm or Tm/Hfus are unavailable.
+    """
+    if Tm is None or Hfus is None or T >= Tm:
+        return 1.0
+
+    ln_a_solid = -(Hfus / R) * (1.0 / T - 1.0 / Tm)
+
+    # Solve in u = ln(phi) so very small solubilities (large r*chi, e.g.
+    # carotenoids in water) are resolved without underflow.
+    def f(u):
+        phi = np.exp(u)
+        return (u + (1.0 - r) * (1.0 - phi)
+                + r * chi * (1.0 - phi) ** 2 - ln_a_solid)
+
+    # f -> -inf as u -> -inf and f(0) = -ln_a_solid > 0, so a root always exists.
+    # Scan up from the dilute side for the first sign change (lowest root).
+    u_lo = min(-50.0, ln_a_solid - abs(1.0 - r) - r * abs(chi) - 10.0)
+    grid = np.linspace(u_lo, -1e-12, 2000)
+    vals = [f(u) for u in grid]
+    for lo, hi, flo, fhi in zip(grid[:-1], grid[1:], vals[:-1], vals[1:]):
+        if flo < 0 <= fhi:
+            return float(np.exp(brentq(f, lo, hi, xtol=1e-12)))
+    return 1.0
+
+
+# =============================================================================
 # MAIN PREDICTION FUNCTION
 # =============================================================================
 
@@ -1066,6 +1152,7 @@ def get_compound_data(compound_input: str) -> Tuple[Optional[PolymerData], str]:
             if hsp is not None and density_result is not None:
                 density, density_source = density_result
 
+                mol = Chem.MolFromSmiles(smiles_to_use)
                 return PolymerData(
                     hsp=hsp,
                     hsp_source=f"{hsp.source} (SMILES from {smiles_source})",
@@ -1073,18 +1160,29 @@ def get_compound_data(compound_input: str) -> Tuple[Optional[PolymerData], str]:
                     density_source=f"{density_source} (SMILES from {smiles_source})",
                     N=1,  # Small molecule - degree of polymerization = 1
                     N_source='small_molecule',
+                    MW=Descriptors.MolWt(mol) if mol is not None else None,
+                    smiles=smiles_to_use,
                 ), f'estimated_small_molecule_via_{smiles_source}'
 
     return None, 'not_found'
 
 
-def predict_compound_solubility(solute_name: str, solvent_name: str, T: float = T_REF) -> dict:
+def predict_compound_solubility(solute_name: str, solvent_name: str, T: float = T_REF,
+                                use_sle: bool = True) -> dict:
     """
     Predict solubility of a small molecule compound in a solvent (g/L).
 
     This is an alternative to UNIFAC-based methods for compounds not in
     thermosteam or lacking suitable UNIFAC groups. Uses Hansen Solubility
     Parameters with Flory-Huggins (N=1).
+
+    Two limits are calculated and the lower one sets the solubility (eq. 9):
+        - phi_LLE: liquid-liquid limit, Flory-Huggins binodal
+                   (find_equilibrium_phi). Treats the solute as a liquid.
+        - phi_SLE: solid-liquid limit from the heat of fusion and melting
+                   point with the Flory-Huggins activity (calculate_sle_phi).
+                   Tm and Hfus are estimated from structure with the Van
+                   Krevelen group contributions. Only applies to solids (T < Tm).
 
     Parameters
     ----------
@@ -1094,14 +1192,19 @@ def predict_compound_solubility(solute_name: str, solvent_name: str, T: float = 
         Solvent name (e.g., 'water', 'ethanol')
     T : float
         Temperature (K), default 298.15
+    use_sle : bool
+        If False, only the liquid-liquid limit is used (previous behaviour).
 
     Returns
     -------
     dict with:
         - solubility_g_L: Equilibrium concentration (g/L)
-        - phi_solute: Volume fraction
+        - phi_solute: Volume fraction = min(phi_SLE, phi_LLE)
+        - phi_LLE, phi_SLE: the two limits
+        - limiting: 'SLE' or 'LLE'
         - chi: Flory-Huggins parameter
-        - status: miscible/partial/low_solubility/immiscible
+        - status: miscible/partial/low_solubility/immiscible (LLE result)
+        - Tm, Hfus, fusion_source: fusion data used
         - Ra: Hansen distance
     """
     # Get solvent
@@ -1119,10 +1222,24 @@ def predict_compound_solubility(solute_name: str, solvent_name: str, T: float = 
     # Calculate chi (N=1 for small molecules)
     chi_hsp = calculate_chi(solute.hsp, solvent.hsp, solvent.Vm, T)
     chi_total = chi_hsp
-    chi_c = calculate_chi_critical(solute.N)  # For N=1, chi_c = 2.0
+    chi_c = calculate_chi_critical(solute.N)  # For N=1, chi_c = 0.5
 
-    # Find equilibrium volume fraction
-    phi, _ = find_equilibrium_phi(chi_total, solute.N)
+    # Liquid-liquid limit (Flory-Huggins binodal)
+    phi_lle, status = find_equilibrium_phi(chi_total, solute.N)
+
+    # Solid-liquid limit (heat of fusion)
+    phi_sle, r = 1.0, None
+    Tm = Hfus = None
+    fusion_source = 'not_used'
+    MW = solute.MW
+    if use_sle:
+        Tm, Hfus, fusion_source = estimate_fusion_properties(solute.smiles)
+        if MW is not None and solute.density > 0 and Tm is not None and Hfus is not None:
+            r = (MW / solute.density) / solvent.Vm      # eq. 8
+            phi_sle = calculate_sle_phi(chi_total, r, T, Tm, Hfus)
+
+    phi = min(phi_sle, phi_lle)                         # eq. 9
+    limiting = 'SLE' if phi_sle < phi_lle else 'LLE'
 
     # Convert to g/L
     solubility = phi * solute.density * 1000
@@ -1141,13 +1258,23 @@ def predict_compound_solubility(solute_name: str, solvent_name: str, T: float = 
         # Main results
         'solubility_g_L': solubility,
         'phi_solute': phi,
+        'phi_LLE': phi_lle,
+        'phi_SLE': phi_sle,
+        'limiting': limiting,
+        'status': status,
         'chi': chi_total,
         'chi_critical': chi_c,
+        'r': r,
         'Ra': Ra,
+        # Fusion data
+        'Tm': Tm,
+        'Hfus': Hfus,
+        'fusion_source': fusion_source,
         # Solute data
         'solute_hsp': {'dD': solute.hsp.dD, 'dP': solute.hsp.dP, 'dH': solute.hsp.dH},
         'solute_hsp_source': solute.hsp_source,
         'solute_density': solute.density,
+        'solute_MW': MW,
         # Solvent data
         'solvent_hsp': {'dD': solvent.hsp.dD, 'dP': solvent.hsp.dP, 'dH': solvent.hsp.dH},
         'solvent_Vm': solvent.Vm,
@@ -1190,6 +1317,20 @@ if __name__ == "__main__":
         for solvent in solvents:
             r = predict_compound_solubility(compound, solvent)
             if 'error' not in r:
-                print(f"  {solvent}: {r['solubility_g_L']:.2f} g/L (χ={r['chi']:.3f})")
+                print(f"  {solvent}: {r['solubility_g_L']:.2f} g/L (χ={r['chi']:.3f}, "
+                      f"limit={r['limiting']}, fusion data: {r['fusion_source']})")
             else:
                 print(f"  {solvent}: {r['error']}")
+
+    # Check against measured data: paracetamol, Granberg & Rasmuson (1999)
+    # J Chem Eng Data 44, 1391.
+    # Measured at 25 °C: water ≈ 15 g/L, ethanol ≈ 146 g/L (g per L solution)
+    print("\n--- PARACETAMOL CHECK (measured: water ≈ 15, ethanol ≈ 146 g/L) ---")
+    for solvent in ['water', 'ethanol']:
+        r = predict_compound_solubility('CC(=O)Nc1ccc(O)cc1', solvent)
+        if 'error' not in r:
+            print(f"  {solvent}: LLE only {r['phi_LLE']*r['solute_density']*1000:.1f} g/L, "
+                  f"SLE only {r['phi_SLE']*r['solute_density']*1000:.1f} g/L, "
+                  f"result {r['solubility_g_L']:.1f} g/L (limit={r['limiting']})")
+        else:
+            print(f"  {solvent}: {r['error']}")
