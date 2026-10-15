@@ -16,7 +16,6 @@ from biosteam import Unit
 import thermosteam as tmo
 from thermosteam import Stream
 import numpy as np
-from math import pi
 
 # Import HSP-based solubility prediction for compounds without UNIFAC groups
 try:
@@ -82,7 +81,7 @@ def calculate_k1_from_Dab(Dab, ParticleR, X, Cs):
     """
     Calculate the rate constant k1 from diffusion coefficient.
 
-    k1 = R² / (15 * π * Dab * X * Cs)
+    k1 = R² / (15 * Dab * X * Cs)
 
     Parameters
     ----------
@@ -102,7 +101,7 @@ def calculate_k1_from_Dab(Dab, ParticleR, X, Cs):
     """
     if Cs <= 0 or Dab <= 0:
         return float('inf')
-    k1 = (ParticleR**2) / (15 * pi * Dab * X * Cs)
+    k1 = (ParticleR**2) / (15 * Dab * X * Cs)
     return k1
 
 
@@ -769,7 +768,7 @@ class SolidSolventExtractor(Unit):
 
         C(t) = t / (k1 + t/C_eq)
 
-    where k1 = R² / (15 × π × Dab × X × Cs)
+    where k1 = R² / (15 × Dab × X × Cs)
 
     Parameters
     ----------
