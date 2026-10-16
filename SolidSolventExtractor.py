@@ -814,6 +814,11 @@ class SolidSolventExtractor(Unit):
         Convergence tolerance for SLE. Default is 0.001.
     lle_attempts : int, optional
         Number of LLE consensus attempts. Default is 3.
+    heat_efficiency : float, optional
+        Fraction of the UAE/MAE electrical power converted to heat in the
+        slurry. That heat is removed by a cooling utility so the extractor
+        stays at its operating temperature. Default is 0.70. Not applied to
+        conventional (agitated) tanks.
     cake_liquid_content : float, optional
         Mass fraction of liquid in the centrifuge cake (residual stream).
         Extract (solvent plus dissolved compounds, at the extract's
@@ -874,11 +879,13 @@ class SolidSolventExtractor(Unit):
         - Base cost: $68,800 at 3.6 kW (CEPCI 798.88, 2025)
         - Scaling exponent: 1.0
         - Power: 66.66 W per L of vessel volume
+        - Bare module: 2.5
 
     - **Microwave Extractor (MAE):**
         - Base cost: $180,000 at 100 kW (CEPCI 596.2, 2020)
         - Scaling exponent: 0.6
         - Power: 83.33 W per L of vessel volume
+        - Bare module: 2.5
 
     - **Centrifuge:** Based on Seider et al. (2017)
         - Base cost: $68,040 at 1 ton/hr solids
@@ -890,6 +897,9 @@ class SolidSolventExtractor(Unit):
     - Conventional tank agitation: 0.5 kW per m³ of each CSTR's volume
     - UAE: 66.66 W per L of each CSTR's volume (V = Q x tau)
     - MAE: 83.33 W per L of each CSTR's volume (V = Q x tau)
+    - UAE/MAE cooling duty: heat_efficiency (default 70%) of the extractor
+      power is heat added to the slurry, removed by a cooling utility at
+      the operating temperature to keep T constant
     - Centrifuge: 1.4 kW per m³/hr of throughput (single unit)
 
     Examples
@@ -930,7 +940,10 @@ class SolidSolventExtractor(Unit):
               'Extractor power': 'kW',
               'Tank power': 'kW',
               'Centrifuge power': 'kW',
-              'Total power': 'kW'}
+              'Total power': 'kW',
+              'Heat to slurry': 'kW',
+              'Cooling duty': 'kJ/hr',
+              'Cooling offset by solvent heater': 'kJ/hr'}
 
     _has_power_utility = True
 
@@ -961,6 +974,7 @@ class SolidSolventExtractor(Unit):
                  sle_tol=0.001,
                  lle_attempts=3,
                  cake_liquid_content=0.40,
+                 heat_efficiency=0.70,
                  verbose=False):
 
         Unit.__init__(self, ID, ins, outs, thermo)
@@ -977,6 +991,7 @@ class SolidSolventExtractor(Unit):
         self.sle_tol = sle_tol
         self.lle_attempts = lle_attempts
         self.cake_liquid_content = cake_liquid_content
+        self.heat_efficiency = heat_efficiency
         self.verbose = verbose
 
         # Results storage
@@ -1695,6 +1710,28 @@ class SolidSolventExtractor(Unit):
         Design['Total power'] = total_power
 
         self.power_utility(total_power)
+
+        # ------------------------------------------------------------------
+        # Cooling duty for UAE/MAE: a fraction `heat_efficiency` of the
+        # electrical extractor power ends up as heat in the slurry. To hold
+        # the operating temperature constant that heat must be removed, so a
+        # cooling utility (negative duty) is added at the operating T.
+        # ------------------------------------------------------------------
+        if self._reactor_type in ('ultrasound', 'microwave'):
+            eta = float(self.heat_efficiency or 0.0)
+            if not 0.0 <= eta <= 1.0:
+                raise ValueError(
+                    f"heat_efficiency must be in [0, 1]; got {self.heat_efficiency}")
+            heat_kW = Design['Extractor power'] * eta
+            cooling_duty = -heat_kW * 3600.0          # kW -> kJ/hr (removed)
+            T_op = extract_out.T
+            if cooling_duty < 0:
+                self.add_heat_utility(cooling_duty, T_op, T_op)
+        else:
+            heat_kW = 0.0
+            cooling_duty = 0.0
+        Design['Heat to slurry'] = heat_kW
+        Design['Cooling duty'] = cooling_duty
 
     def _cost(self):
         """Calculate equipment costs based on reactor type.
