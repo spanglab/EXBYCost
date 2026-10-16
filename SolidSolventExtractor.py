@@ -873,12 +873,12 @@ class SolidSolventExtractor(Unit):
     - **Ultrasound Extractor (UAE):**
         - Base cost: $68,800 at 3.6 kW (CEPCI 798.88, 2025)
         - Scaling exponent: 1.0
-        - Power: 1.625 kW per L/min of total flow
+        - Power: 66.66 W per L of vessel volume
 
     - **Microwave Extractor (MAE):**
         - Base cost: $180,000 at 100 kW (CEPCI 596.2, 2020)
         - Scaling exponent: 0.6
-        - Power: 12.5 kW per L/min of total flow
+        - Power: 83.33 W per L of vessel volume
 
     - **Centrifuge:** Based on Seider et al. (2017)
         - Base cost: $68,040 at 1 ton/hr solids
@@ -888,10 +888,8 @@ class SolidSolventExtractor(Unit):
     **Power Requirements:**
 
     - Conventional tank agitation: 0.5 kW per m³ of each CSTR's volume
-    - UAE: 1.625 kW per L/min of total flow, split equally across the
-      N_stages CSTRs (total power is the same as a single unit; the
-      correlation is an energy dose per unit throughput)
-    - MAE: 12.5 kW per L/min of total flow, split equally as for UAE
+    - UAE: 66.66 W per L of each CSTR's volume (V = Q x tau)
+    - MAE: 83.33 W per L of each CSTR's volume (V = Q x tau)
     - Centrifuge: 1.4 kW per m³/hr of throughput (single unit)
 
     Examples
@@ -939,6 +937,11 @@ class SolidSolventExtractor(Unit):
     # Accessibility factors for different reactor types
     # These factors account for how effectively the solvent can access
     # the solute within the solid matrix
+    # Volumetric power densities for assisted extraction (W per L of vessel
+    # volume). Applied to each CSTR's volume, so total power = density x V.
+    UAE_POWER_DENSITY = 66.66   # W/L
+    MAE_POWER_DENSITY = 83.33   # W/L
+
     ACCESSIBILITY_FACTORS = {
         'conventional': 0.67,
         'ultrasound': 0.86,
@@ -1667,23 +1670,21 @@ class SolidSolventExtractor(Unit):
         centrifuge_power = Q_total * 1.40
 
         # Extractor power is evaluated per CSTR, then multiplied by N
-        Q_total_l_min = Q_total * 1000 / 60  # m³/hr -> L/min
+        V_stage_L = V_stage * 1000  # m³ -> L
         if self._reactor_type == 'conventional':
             # Stirred tank agitation: 0.5 kW per m³ of each CSTR
             stage_power = V_stage * 0.5
             Design['Extractor power per CSTR'] = 0  # not used for costing
             Design['Extractor power'] = 0
         elif self._reactor_type == 'ultrasound':
-            # UAE: 1.625 kW per L/min of total flow is a specific energy dose
-            # (~97.5 J/mL) delivered once over the whole residence time, so
-            # it is split equally across the N stages (total = single unit).
-            stage_power = 1.625 * Q_total_l_min / N
+            # UAE: volumetric power density applied to each CSTR's volume
+            # (V = flow x residence time), so total power scales with V.
+            stage_power = self.UAE_POWER_DENSITY * V_stage_L / 1000  # W -> kW
             Design['Extractor power per CSTR'] = stage_power
             Design['Extractor power'] = stage_power * N
         elif self._reactor_type == 'microwave':
-            # MAE: 12.5 kW per L/min of total flow, split equally across the
-            # N stages for the same reason (total = single unit).
-            stage_power = 12.5 * Q_total_l_min / N
+            # MAE: volumetric power density applied to each CSTR's volume.
+            stage_power = self.MAE_POWER_DENSITY * V_stage_L / 1000  # W -> kW
             Design['Extractor power per CSTR'] = stage_power
             Design['Extractor power'] = stage_power * N
 
