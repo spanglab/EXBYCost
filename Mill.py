@@ -15,8 +15,8 @@ class Mill(bst.Unit):
         Output P is in kW
 
     Cost correlation (based on power):
-        If moisture < 0.3: Knife mill ($11,250 @ 166 kW, 2006)
-        If moisture >= 0.3: Wet ball mill ($100,000 @ 33.5 kW, 2006)
+        If moisture < 0.3: Knife mill ($10,300 @ 6 kW, 1996, CEPCI 381.7, n = 0.5)
+        If moisture >= 0.3: Wet ball mill ($100,000 @ 33.5 kW, 2002, CEPCI 394.3, n = 0.664)
 
     Parameters
     ----------
@@ -44,17 +44,19 @@ class Mill(bst.Unit):
         'Knife mill': {
             'basis': 'Power',
             'units': 'kW',
-            'cost': 11250,
-            'CE': 499.6,
-            'n': 0.664,
+            'cost': 10300,
+            'year': 1996,
+            'CE': 381.7,
+            'n': 0.5,
             'BM': 1.5,
-            'S': 166,
+            'S': 6,
         },
         'Wet ball mill': {
             'basis': 'Power',
             'units': 'kW',
             'cost': 100000,
-            'CE': 499.6,
+            'year': 2002,
+            'CE': 394.3,
             'n': 0.664,
             'BM': 1.5,
             'S': 33.5,
