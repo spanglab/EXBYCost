@@ -87,6 +87,7 @@ THRESHOLDS = {
     'Phenolic Compounds':     {'water': 90,   'other_solvent': 90,   'drying': 60},
     'Flavonoids':             {'water': 90,   'other_solvent': 90,   'drying': 60},
     'Levulinic Acid':         {'water': 200,  'other_solvent': 200,  'drying': 200},
+    '5-HMF':                  {'water': 110,  'other_solvent': None, 'drying': None},
 }
 
 # Carotenoids (group): any carotenoid that is NOT itself a named row
@@ -104,6 +105,7 @@ COMPOUND_TYPE = {
     'EGCG': 'specific', 'Allicin': 'specific', 'Alpha-Tocopherol': 'specific',
     'Vitamin B1 (Thiamine)': 'specific', 'Phycocyanin': 'specific',
     'Monoethanolamine (MEA)': 'specific', 'Levulinic Acid': 'specific',
+    '5-HMF': 'specific',
     'Anthocyanins': 'group', 'Polyphenols': 'group', 'Betalains': 'group',
     'Curcuminoids': 'group', 'Capsaicinoids': 'group', 'Terpenes': 'group',
     'PUFAs': 'group', 'Glycosides': 'group', 'Phenolic Compounds': 'group',
@@ -155,6 +157,15 @@ NAMED_COMPOUNDS = {
         'names': ['levulinic acid', 'laevulinic acid', 'levulinate',
                   '4-oxopentanoic acid'],
         'cas': ['123-76-2'], 'chebi': [37547]},
+    # 5-Hydroxymethylfurfural. Threshold applies to aqueous heating only
+    # (110 C); other-solvent and drying columns are N/A.
+    '5-HMF': {
+        'names': ['5-hmf', 'hmf', '5-hydroxymethylfurfural',
+                  '5-(hydroxymethyl)furfural', 'hydroxymethylfurfural',
+                  '5-hydroxymethyl-2-furaldehyde',
+                  '5-(hydroxymethyl)-2-furaldehyde',
+                  '5-(hydroxymethyl)furan-2-carbaldehyde'],
+        'cas': ['67-47-0'], 'chebi': []},
 }
 
 
