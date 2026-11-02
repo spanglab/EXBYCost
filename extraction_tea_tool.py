@@ -14,11 +14,13 @@ import math as _math
 import flexsolve as flx
 import numpy as np
 from scipy.optimize import brentq
-from SolidSolventExtractor import SolidSolventExtractor
+from SolidSolventExtractor import SolidSolventExtractor, MIN_PARTICLE_RADIUS
 import matplotlib.pyplot as plt
 import pandas as pd
 from PIL import Image
 from Mill import Mill
+from PowderDesolventizer import (PowderDesolventizer, DESOLV_DEFAULTS,
+                                 perry_cost_data_ready)
 from biosteam_proxy_finder import assign_proxies
 from pricing import (get_solvent_prices, get_california_industrial_price,
                      get_california_operator_wage)
@@ -644,7 +646,19 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
 
             total_mol = feed.F_mol
             if total_mol > 0:
-                V_max = feed.imol[chemical] / total_mol * 0.999
+                # Upper bound on the molar vapour fraction. It must cover ALL
+                # components that can vaporise, not just the solvent: with
+                # water (or another volatile) in the feed, part of the vapour
+                # is water, so a bound of x_solvent * 0.999 cannot strip the
+                # solvent down to target. The objective then has the same sign
+                # at both ends ("f(x0) and f(x1) must have opposite signs")
+                # and the bisection rescue lands on the wrong V. Phase-locked
+                # solutes never vaporise and stay excluded.
+                volatile_mol = sum(
+                    feed.imol[c.ID] for c in feed.chemicals
+                    if getattr(c, 'locked_state', None) is None
+                    and feed.imol[c.ID] > 0.)
+                V_max = max(feed.imol[chemical], volatile_mol) / total_mol * 0.999
             else:
                 V_max = 0.9
 
@@ -685,7 +699,36 @@ class CorrectedMEE(bst.MultiEffectEvaporator):
                     liq.P = out_wt_solids.P
                     return
 
+            # MASS-BALANCE CHECK on the final flash. Its only job is to leave
+            # target_remaining of the solvent in the liquid for this V. With
+            # some chemical sets it returns a liquid that misses badly without
+            # raising (seen with a hexane extract: ~0.2 kg/h left for every V
+            # from 0.93 to 0.999). The concentrate then no longer depends on
+            # V, the outer solids spec cannot reach its target and parks at
+            # V = 0.1 (one atmospheric effect). Treat that the same as a
+            # failed flash: use the existing limiting-split fallback, which
+            # sets _flash_fallback_used so the run is flagged (evap_n_fb) and
+            # the duty/area come from the energy-balance shortcut.
+            _liq_s = mixed_stream.imol['l', chemical]
+            _tol = (1e-2 * max(target_remaining, 1e-6 * feed.imol[chemical])
+                    + 1e-12)
+            if abs(_liq_s - target_remaining) > _tol:
+                self._flash_fallback_used = True
+                self._note_guard(
+                    'final flash missed solvent target -> limiting split',
+                    ValueError(f"flash left {_liq_s:.4g} kmol/h solvent, "
+                               f"target {target_remaining:.4g} kmol/h"))
+                _assign_limiting_split()
+                liq.P = out_wt_solids.P
+                return
+
             out_wt_solids.mol = mixed_stream.imol['l']
+            # Report the concentrate at the conditions of the flash that set
+            # its composition (last-effect pressure, its bubble point), not
+            # at whatever T/P the stream held from an earlier pass.
+            out_wt_solids.phase = 'l'
+            out_wt_solids.P = last_evaporator.P
+            out_wt_solids.T = mixed_stream.T
             if liq.phase == 'l':
                 liq.phase = 'l'
                 liq.mol = mixed_stream.imol['g']
@@ -753,6 +796,167 @@ class SolventSprayDryer(bst.Unit):
             actual_duty = duty / self.thermal_efficiency
             T_out = max(self.T, self.ins[0].T)
             self.add_heat_utility(actual_duty, T_in=self.ins[0].T, T_out=T_out)
+
+
+# ============================================================================
+# Vacuum Drum Dryer (alternative to the spray dryer)
+# ----------------------------------------------------------------------------
+# Basis: ECN-E--17-084, "Thin Film Drying Processes: Energy- and economic
+# aspects compared to spray drying" (de Smidt, Wemmers, Spoelstra; ECN 2017),
+# vacuum drum case at 500 kg water/h, 0.05 bara, product 60 C:
+#   41 m2 drum, 2.63 GJ/t water (incl. 5 % heat loss), 1.8 kW/m2 drive,
+#   26.3 kW vacuum pump, ISBL cost 1.35 M EUR (+/-30 %, factorial estimate,
+#   includes feed pump, drum, pressure vessels and condenser).
+# Temperature range 40-80 C: Wageningen Food & Biobased Research poster
+# "Drying of bio refinery product streams" (https://edepot.wur.nl/478630).
+# ============================================================================
+VDD_REF_AREA = 41.          # m2, ECN vacuum drum at 500 kg water/h
+VDD_REF_COST_EUR = 1.35e6   # EUR, ISBL (installed), +/-30 %
+VDD_EUR_TO_USD = 1.13       # ASSUMPTION: approx. 2017 average exchange rate
+VDD_COST_EXPONENT = 0.5     # fit of ECN Table 10 (0.42-0.53)
+VDD_MAX_AREA = 45.          # m2, largest single drum quoted by ECN
+VDD_CEPCI = 567.5           # ASSUMPTION: 2017 index (ECN report year)
+VDD_P_ATM = 101325.         # Pa
+VDD_P_ECN = 5000.           # Pa, ECN operating pressure (0.05 bara)
+VDD_T_MIN_C = 40.           # C, lower limit of the temperature input
+VDD_T_MAX_C = 80.           # C, upper limit of the temperature input
+VDD_T_DEFAULT_C = 60.       # C, ECN product temperature
+VDD_MAX_EVAP_RATE = 500. / 41.   # kg/m2/hr, ECN vacuum drum case (12.2);
+                                 # ECN's literature value for vacuum drums is
+                                 # about 10. Caps evaporation per drum area so
+                                 # low-latent-heat solvents (hexane, acetone)
+                                 # are not sized on heat flux alone.
+
+
+@cost('Drum area', ID='Vacuum drum dryer', CE=VDD_CEPCI, S=VDD_REF_AREA,
+      units='m2', n=VDD_COST_EXPONENT, ub=VDD_MAX_AREA, BM=1.0,
+      cost=VDD_REF_COST_EUR * VDD_EUR_TO_USD)
+class VacuumDrumDryer(bst.Unit):
+    """
+    Vacuum drum dryer. Same streams and arguments as SolventSprayDryer:
+    outs = [vapor, dried solids]; only ``solvent`` evaporates.
+
+    T (product/vapour temperature, K) is the input, limited to 40-80 C.
+    Pressure is calculated: P = pressure_ratio * Psat(solvent, T), capped at
+    1 atm. The default pressure_ratio is ECN's: 5 kPa / Psat(water, 60 C)
+    = 0.251, so every solvent runs at the same fraction of its own vapour
+    pressure as ECN's water case.
+
+    Heat duty = (H_out - H_in) / thermal_efficiency. thermal_efficiency =
+    0.95 is the dryer's own efficiency (ECN: 5 % heat loss); ECN's 2.63 GJ/t
+    already includes it, so no other efficiency is applied.
+
+    Drum area = max(Q / (U * (T_jacket - T)), evaporation / max_evap_rate).
+    U = 0.182 kW/m2/K is back-calculated from ECN (372 kW, 41 m2, 110 C
+    jacket, 60 C product). max_evap_rate defaults to ECN's 12.2 kg/m2/hr:
+    the heat-flux area alone would let a solvent with a low latent heat
+    (hexane 342 kJ/kg vs water 2358 kJ/kg) evaporate ~90 kg/m2/hr, far above
+    the ~10 kg/m2/hr reported for vacuum drums, and give a very small,
+    cheap drum. With the cap, area per kg evaporated is the same as ECN's.
+
+    Electricity = 1.8 kW/m2 drive + vacuum pump 0.64 kW/m2 at 5 kPa, the pump
+    term scaled by ln(P_atm/P)/ln(P_atm/5 kPa) (scaling is an assumption).
+    U, drive and pump figures come from the single ECN water case.
+
+    Cost = ECN ISBL cost scaled on drum area (n = 0.5), BM = 1 because the
+    ECN figure is already installed; parallel drums above 45 m2. The ECN
+    cost includes a condenser, so a separate condenser on the vapour is
+    partly double counted.
+    """
+    _units = {'Drum area': 'm2', 'Evaporation': 'kg/hr', 'Heat duty': 'kW',
+              'Pressure': 'kPa', 'Evaporation rate': 'kg/m2/hr',
+              'Specific heat': 'GJ/t'}
+    _N_ins = 1
+    _N_outs = 2
+    T_min = VDD_T_MIN_C + 273.15
+    T_max = VDD_T_MAX_C + 273.15
+
+    def _init(self, solvent='Water', moisture_content=0.05,
+              T=VDD_T_DEFAULT_C + 273.15, thermal_efficiency=0.95,
+              pressure_ratio=None, T_jacket=383.15, U=0.182,
+              drive_kW_per_m2=1.8, vacuum_pump_kW_per_m2=0.64,
+              max_evap_rate=None):
+        self.solvent = solvent
+        self.moisture_content = moisture_content
+        self.T = T
+        self.thermal_efficiency = thermal_efficiency
+        if pressure_ratio is None:
+            pressure_ratio = VDD_P_ECN / tmo.Chemical('Water').Psat(333.15)
+        self.pressure_ratio = pressure_ratio
+        self.T_jacket = T_jacket
+        self.U = U
+        self.drive_kW_per_m2 = drive_kW_per_m2
+        self.vacuum_pump_kW_per_m2 = vacuum_pump_kW_per_m2
+        self.max_evap_rate = max_evap_rate
+        self.P = VDD_P_ATM
+
+    @property
+    def T(self):
+        return self._T
+    @T.setter
+    def T(self, T):
+        if not (self.T_min - 1e-6 <= T <= self.T_max + 1e-6):
+            raise ValueError(
+                f"Vacuum drum dryer temperature must be {VDD_T_MIN_C:.0f}-"
+                f"{VDD_T_MAX_C:.0f} C, got {T - 273.15:.1f} C")
+        self._T = T
+
+    def _run(self):
+        feed = self.ins[0]
+        vapor, solids = self.outs
+        T = self.T
+        solids.copy_like(feed)
+        solids.phase = 'l'   # dried product leaves as liquid/solid, never vapour
+        vapor.empty()
+        Psat = tmo.settings.chemicals[self.solvent].Psat(T)
+        self.P = min(self.pressure_ratio * Psat, VDD_P_ATM)
+        vapor.phase = 'g'
+        if solids.F_mass > 0:
+            frac = solids.imass[self.solvent] / solids.F_mass
+            if frac > self.moisture_content:
+                vapor.copy_flow(solids, self.solvent, remove=True)
+                separations.adjust_moisture_content(
+                    solids, vapor, self.moisture_content, ID=self.solvent)
+                vapor.phase = 'g'
+        vapor.T = solids.T = T
+        vapor.P = solids.P = self.P
+
+    def _design(self):
+        D = self.design_results
+        E = self.outs[0].F_mass
+        # Feed enthalpy on a LIQUID basis: the concentrate leaving an
+        # evaporator is a saturated liquid. If the upstream unit hands over a
+        # stream flagged as vapour, its stream enthalpy already contains the
+        # latent heat, the dryer duty collapses to ~0 and the drum (and its
+        # cost) shrinks to nothing. Sensible heat of a hot liquid feed is
+        # still credited.
+        feed = self.ins[0]
+        H_in = self.thermo.mixture.H('l', feed.mol, feed.T, feed.P)
+        duty = (self.H_out - H_in) / self.thermal_efficiency      # kJ/hr
+        Q = max(duty, 0.) / 3600.                                   # kW
+        dT = self.T_jacket - self.T
+        A = Q / (self.U * dT) if Q > 0 else 0.
+        self.area_limit = 'heat transfer'
+        if self.max_evap_rate and E / self.max_evap_rate > A:
+            A = E / self.max_evap_rate
+            self.area_limit = 'evaporation rate'
+        D['Drum area'] = max(A, 1e-3)
+        D['Evaporation'] = E
+        D['Heat duty'] = Q
+        D['Pressure'] = self.P / 1e3
+        D['Evaporation rate'] = E / A if A else 0.
+        D['Specific heat'] = Q * 3.6 / E if E else 0.   # GJ/t evaporated
+        if duty > 0:
+            self.add_heat_utility(duty, self.T_jacket)
+
+    def _cost(self):
+        self._decorated_cost()
+        A = self.design_results['Drum area']
+        kW = self.drive_kW_per_m2 * A
+        if self.P < VDD_P_ATM:
+            scale = log(VDD_P_ATM / self.P) / log(VDD_P_ATM / VDD_P_ECN)
+            kW += self.vacuum_pump_kW_per_m2 * A * scale
+        self.add_power_utility(kW)
 
 
 # ============================================================================
@@ -840,13 +1044,85 @@ class SolidCooler(bst.Unit):
 
 
 # ============================================================================
+# Seasonal feedstock drum dryer (BioSTEAM DrumDryer sized for harvest season)
+# ============================================================================
+class SeasonalDrumDryer(bst.DrumDryer):
+    """BioSTEAM's stock DrumDryer, sized for a seasonal feedstock.
+
+    The plant runs all year from storage, but the feedstock only arrives
+    during its harvest months, so the dryer upstream of storage has to dry
+    a whole year's feed in that window. Its throughput while running is
+
+        peak = average x 12 / harvest_months
+
+    The drum (volume, diameter, length, peripheral area) and therefore its
+    purchase cost are sized on that peak evaporation rate.
+
+    Annual energy is NOT scaled: the dryer runs harder but for only
+    harvest_months / 12 of the year, so the same total water is evaporated.
+    The heat duty / natural-gas flow therefore stay at the year-average
+    hourly rate the TEA already multiplies by operating hours, and the
+    drum-drive power (which BioSTEAM scales linearly with drum area) is
+    divided back down by the same factor.
+
+    harvest_months = 12 (or None) reproduces the stock DrumDryer exactly.
+    """
+    _units = {**bst.DrumDryer._units,
+              'Harvest months': 'months',
+              'Season scale factor': '-'}
+
+    def _init(self, *args, harvest_months=12, **kwargs):
+        super()._init(*args, **kwargs)
+        self.harvest_months = harvest_months
+
+    @property
+    def season_factor(self):
+        """Peak-to-average throughput factor, 12 / harvest_months."""
+        n = self.harvest_months
+        if not n:
+            return 1.0
+        n = min(max(float(n), 1.0), 12.0)
+        return 12.0 / n
+
+    def _design(self):
+        super()._design()      # sizes on the average rate, books heat duty
+        f = self.season_factor
+        D = self.design_results
+        D['Harvest months'] = 12.0 / f
+        D['Season scale factor'] = f
+        if f > 1.0:
+            # Same geometry rules as BioSTEAM's DrumDryer._design, applied
+            # to the harvest-season (peak) evaporation rate.
+            volume = D['Evaporation'] * f / self.H
+            diameter = (4.0 * volume / _math.pi
+                        / self.length_to_diameter) ** (1.0 / 3.0)
+            length = diameter * self.length_to_diameter
+            D['Volume'] = volume
+            D['Diameter'] = diameter
+            D['Length'] = length
+            D['Peripheral drum area'] = _math.pi * diameter * length
+
+    def _cost(self):
+        super()._cost()        # cost + drive power from the peak-sized drum
+        f = self.season_factor
+        if f > 1.0:
+            # Bigger drum, fewer running hours: keep annual kWh unchanged.
+            self.power_utility.consumption /= f
+
+
+# ============================================================================
 # Feedstock Drum Dryer (indirect steam-tube rotary drum dryer)
 # ============================================================================
 @cost('Heat transfer area', CE=567, units='ft^2', BM=2.06,
       cost=1520, S=1, n=0.80)
 class FeedDrumDryer(bst.Unit):
     """
-    Rotary drum dryer for the incoming (as-received) feedstock.
+    Indirect steam-tube rotary drum dryer.
+
+    Now used only as the residual drum dryer (SD2), which evaporates
+    solvent from the extractor cake. The feedstock dryer (D101) uses
+    BioSTEAM's stock ``bst.DrumDryer`` instead. The notes below describe the
+    unit's original feed-drying role.
 
     Placed upstream of feedstock storage, this unit dries the wet biomass
     down to a target moisture content before it goes into the storage tank.
@@ -1425,6 +1701,16 @@ def _tornado_figure(df_sens, base_msp, fmt_map=None, max_bars=30):
 
 # Define data dictionaries
 feedstocks = {
+    # ── Tomato pomace ──────────────────────────────────────────────────
+    # Reported totals (dry basis): crude protein 20.5 wt%, total lipid
+    # 11.0 wt%. At start-up macronutrients.complete_feedstock() sums the
+    # listed compounds it classifies (via ChEBI) as protein (amino acids,
+    # peptides) or lipid (fatty acids, glycerides, sterols, carotenoids ...)
+    # and, wherever the measured sum falls short of the reported total,
+    # adds the difference as a model compound (glutathione / trilinolein).
+    # Cellulose is then recomputed as the balance. Where the measured sum already
+    # exceeds the total, the measured compounds are kept and nothing is
+    # added.
     'Tomato pomace': {
         'chems': [
             {'name': 'caffeic_acid',                                         'cas': '331-39-5',            'chebi': 'CHEBI:36281'},
@@ -1500,9 +1786,17 @@ feedstocks = {
             {'name': 'Cellulose',                                            'cas': '9004-34-6',           'chebi': 'CHEBI:18246'},
         ],
         'comp': [5.378e-05, 0.00032512, 7.3e-07, 3.47e-05, 8.198e-05, 0.0001641525, 1.8e-06, 7.693333333e-06, 0.008630384, 0.028214528, 0.04969716, 0.015757848, 0.011231288, 0.010079424, 0.0301307, 0.010293092, 0.011505852, 0.020030436, 0.02148212, 0.01158646, 0.011176904, 0.013830928, 0.0002737587415, 0.0002384133333, 1.505e-05, 6.23e-05, 6.56e-05, 0.0001517, 0.0003788, 9.7e-06, 3.6e-06, 5.24e-05, 4.19e-05, 6.75e-05, 0.0001557, 2.3e-07, 9.3e-06, 5.18e-05, 3.2e-06, 0.0001778, 1.25e-05, 5.76e-05, 4.1e-06, 1.653e-05, 7.2e-06, 5.17e-05, 1.8e-06, 4.1e-06, 2.2915e-05, 2.95e-05, 2.2e-06, 4.4e-06, 5.5e-06, 7.7e-06, 0.0318671, 0.0115962, 0.0511363, 0.082882, 0.002697, 3.24e-06, 0.00011665, 3.6e-07, 1e-05, 0.00048926, 0.254, 0.0078, 0.00897, 0.02262, 0.00049112, 2.059e-05, 0.2689966031],
+        'total_protein': 0.205,   # dry basis, mass fraction
+        'total_lipid': 0.110,     # dry basis, mass fraction
         'moisture': 0.67,
         'type': 'Fruit pomaces'
     },
+    # ── Almond hulls ───────────────────────────────────────────────────
+    # Reported totals (dry basis): protein 5.7 wt%, fat 3.0 wt%. No amino
+    # or fatty acids are listed, so both are added in full as the model
+    # compounds (glutathione / trilinolein). Cellulose is the balance term,
+    # recomputed after that as 1 - (everything else), so the listed value
+    # below (which leaves the list summing to 0.880) does not matter.
     'Almond hulls': {
         'chems': [
             {'name': '3,4 dihydroxybenzoic acid',                            'cas': '99-50-3',             'chebi': 'CHEBI:36062'},
@@ -1521,6 +1815,8 @@ feedstocks = {
             {'name': 'Cellulose',                                            'cas': '9004-34-6',           'chebi': 'CHEBI:18246'},
         ],
         'comp': [2.545e-06, 1.4655e-05, 2.6435e-05, 1.06e-06, 6.55e-07, 4.185e-06, 7.4e-07, 1.095e-06, 5.67e-06, 1.7e-06, 0.0925, 0.021, 0.026, 0.740438815],
+        'total_protein': 0.057,   # reported total, dry basis (5.7 wt%)
+        'total_lipid': 0.030,     # reported total, dry basis (3.0 wt%)
         'moisture': 0.135,
         'type': 'hulls'
     },
@@ -1546,6 +1842,8 @@ feedstocks = {
             {'name': 'Cellulose',                                            'cas': '9004-34-6',           'chebi': 'CHEBI:18246'},
         ],
         'comp': [0.001609565385, 9.354166668e-05, 5.508384616e-05, 0.0001270833333, 2.715833334e-05, 1.719166667e-05, 6.708666668e-06, 3.325e-06, 4.350000001e-06, 8.000000001e-07, 0.0020625, 0.00031614, 1.914e-05, 1.716e-05, 1.188e-05, 3.882262211e-07, 0.0014306075, 0.9941973764],
+        'total_protein': 0.1123,   # reported total, dry basis (11.23 wt%)
+        'total_lipid': 0.2041,    # reported total, dry basis (20.41 wt%)
         'moisture': 0.740667,
         'type': 'hulls'
     },
@@ -1591,6 +1889,8 @@ feedstocks = {
             {'name': 'Cellulose',                                            'cas': '9004-34-6',           'chebi': 'CHEBI:18246'},
         ],
         'comp': [2.9e-05, 3.94e-04, 2.905e-03, 3.163e-03, 1.25e-04, 3.1e-05, 2.7e-05, 9e-06, 1.5e-05, 1e-06, 0, 4e-06, 9e-06, 0, 3.9e-05, 0, 0, 3.9e-05, 2.9e-04, 0, 0, 1e-06, 1e-06, 0, 0, 0, 0, 0, 1e-06, 3e-06, 7e-06, 0, 0, 0, 1e-06, 4.1e-05, 1.1e-05, 0.992852],
+        'total_protein': 0.0378,   # reported total, dry basis (3.78 wt%)
+        'total_lipid': 0.0085,    # reported total, dry basis (0.85 wt%)
         'moisture': 0.156667,
         'type': 'hulls'
     },
@@ -1607,7 +1907,8 @@ feedstocks = {
     #     the mass balance closed and matches the tool's "missing weight
     #     assumed to be cellulose" convention.
     #   * Albumin 50.3 + globulin 47.4 + glutelin 32.6 + prolamin 17.8
-    #     -> one protein term term (148.1 mg/g).
+    #     -> one protein term (148.1 mg/g), modelled as glutathione (see the
+    #     tomato pomace note for why a resolvable model peptide is used).
     'Rice bran (full-fat)': {
         'chems': [
             {'name': 'trilinolein',                                          'cas': '537-40-6',            'chebi': None},            # rice bran oil (TAG)
@@ -1615,7 +1916,7 @@ feedstocks = {
             {'name': 'campesterol',                                          'cas': '474-62-4',            'chebi': 'CHEBI:28623'},   # total phytosterols
             {'name': 'alpha-tocopherol',                                     'cas': '59-02-9',             'chebi': 'CHEBI:177086'},  # tocopherols + tocotrienols
             {'name': 'squalene',                                             'cas': '111-02-4',            'chebi': 'CHEBI:15440'},
-            {'name': 'protein',                                              'cas': None,                  'chebi': None},            # albumin+globulin+glutelin+prolamin
+            {'name': 'glutathione',                                          'cas': '70-18-8',             'chebi': 'CHEBI:16856'},   # protein model peptide: albumin+globulin+glutelin+prolamin
             {'name': 'amylose',                                              'cas': '9005-82-7',           'chebi': 'CHEBI:28102'},
             {'name': 'amylopectin',                                          'cas': '9037-22-3',           'chebi': None},
             {'name': 'phytic acid',                                          'cas': '83-86-3',             'chebi': 'CHEBI:17401'},
@@ -1626,10 +1927,296 @@ feedstocks = {
             {'name': 'Cellulose',                                            'cas': '9004-34-6',           'chebi': 'CHEBI:18246'},   # cellulose + ash, balance
         ],
         'comp': [0.160, 0.0042, 0.007, 0.0002, 0.0005, 0.1481, 0.051, 0.2323, 0.0585, 0.0023, 0.028, 0.140, 0.041, 0.1269],
+        'total_protein': 0.142,   # reported total, dry basis (14.2 wt%)
+        'total_lipid': 0.132,     # reported total, dry basis (13.2 wt%)
         'moisture': 0.10,   # PLACEHOLDER — not in the CSV; typical as-received full-fat rice bran is 8–12 wt%
         'type': 'nuts, seeds and grains'
     },
 }
+
+# ── Protein / lipid accounting ──────────────────────────────────────
+# For every feedstock with 'total_protein' and/or 'total_lipid', classify
+# its listed compounds (ChEBI ancestry, name fallback), compare the measured
+# protein/lipid sums with the reported totals, and fill any shortfall with a
+# model compound (glutathione / trilinolein); the balance term (Cellulose)
+# is recomputed last so the composition sums to 1.
+# See macronutrients.py. ChEBI lookups are cached to chebi_macro_cache.json,
+# so only the first run touches the network or a local chebi .obo file.
+# MACRO_LIPID_SCOPE: 'all'   -> every ChEBI lipid (fatty acids, glycerides,
+#                               sterols, carotenoids, tocopherols ...) counts
+#                               toward total lipid, as in an ether extract;
+#                    'fatty' -> only fatty acids and glycerides count.
+MACRO_LIPID_SCOPE = 'all'
+
+
+@st.cache_data(show_spinner="Classifying feedstock protein and lipid ...")
+def _complete_feedstocks(feedstocks_json, lipid_scope):
+    from macronutrients import (complete_feedstock, classify_feedstock,
+                                ChebiAncestry)
+    fs_all = json.loads(feedstocks_json)
+    resolver = ChebiAncestry()
+    out, reports, classes = {}, {}, {}
+    for name, fs in fs_all.items():
+        try:
+            out[name], reports[name] = complete_feedstock(
+                fs, resolver=resolver, lipid_scope=lipid_scope)
+        except Exception as exc:
+            # Keep the feedstock as listed; the error is shown in the
+            # composition panel when this feedstock is selected.
+            out[name] = fs
+            reports[name] = {'error': f"{type(exc).__name__}: {exc}"}
+        # Per-compound protein/lipid/other classes for EVERY feedstock (with
+        # or without reported totals). Used to sum the protein and lipid in
+        # process streams such as the dried residual.
+        try:
+            classes[name] = classify_feedstock(out[name], resolver=resolver,
+                                               lipid_scope=lipid_scope)
+        except Exception:
+            classes[name] = {}
+    resolver.save()
+    return out, reports, classes
+
+
+feedstocks, MACRO_REPORTS, MACRO_CLASSES = _complete_feedstocks(
+    json.dumps(feedstocks), MACRO_LIPID_SCOPE)
+
+# ── Output labels for the fill-in and balance compounds ─────────────────
+# Display only: the real names (glutathione, trilinolein, Cellulose) stay the
+# chemical IDs everywhere in the model, because the extractor, the ChEBI
+# classes and the degradation thresholds all key on them. In tables, stream
+# listings and CSV columns:
+#   model compound added by the fill-in -> 'Undefined protein' / 'Undefined lipid'
+#   balance compound (Cellulose)        -> 'Unknown'
+# A model compound that was already a measured entry (e.g. rice-bran oil as
+# trilinolein) keeps its own name. Feedstocks without reported totals are
+# left as listed.
+MACRO_DISPLAY = {'protein': 'Undefined protein', 'lipid': 'Undefined lipid',
+                 'balance': 'Unknown'}
+
+
+def _macro_labels(report):
+    if not report or report.get('error'):
+        return {}
+    listed = {r['compound'] for r in report.get('compounds', ())}
+    labels = {}
+    for s in report.get('summary', ()):
+        m = s.get('model_compound')
+        if m and m not in listed:
+            labels[m] = MACRO_DISPLAY[s['component']]
+    labels[report['balance']] = MACRO_DISPLAY['balance']
+    return labels
+
+
+MACRO_LABELS = {name: _macro_labels(rep) for name, rep in MACRO_REPORTS.items()}
+
+# ── Feedstock seasonality ───────────────────────────────────────────
+# Crops harvested in each month (California seasonal produce table).
+# Only the feedstock drum dryer (D101) uses this: it sits upstream of
+# storage, so it must dry the whole year's feed during the harvest months
+# (see SeasonalDrumDryer). Run-on entries in the source table have been
+# split (e.g. 'plums apricots' -> 'plums', 'apricots').
+HARVEST_CALENDAR = {
+    'January':   ['avocados', 'macadamia nuts', 'strawberries', 'broccoli',
+                  'kumquats', 'lemons', 'cabbage', 'cauliflower', 'celery',
+                  'rhubarb', 'carrots', 'beets', 'tangerines', 'snow peas',
+                  'sugar snaps', 'lettuce'],
+    'February':  ['navel oranges', 'lemons', 'avocados', 'kumquats',
+                  'strawberries', 'cauliflower', 'asparagus', 'artichokes',
+                  'rhubarb', 'tangerines', 'tangelos', 'carrots', 'celery',
+                  'cabbage', 'peas', 'beets'],
+    'March':     ['navel oranges', 'lemons', 'strawberries', 'squash',
+                  'rhubarb', 'asparagus', 'carrots', 'peas', 'artichokes',
+                  'tangelos', 'grapefruit', 'avocados'],
+    'April':     ['navel oranges', 'valencia oranges', 'grapefruit', 'lemons',
+                  'avocados', 'strawberries', 'squash', 'snap peas', 'beans',
+                  'carrots', 'beets', 'turnips', 'radishes'],
+    'May':       ['valencia oranges', 'grapefruit', 'lemons', 'strawberries',
+                  'avocados', 'sweet corn', 'peas', 'beans', 'squash',
+                  'potatoes', 'tomatoes', 'carrots', 'sweet onions',
+                  'cucumbers'],
+    'June':      ['valencia oranges', 'grapefruit', 'lemons', 'peaches',
+                  'plums', 'apricots', 'avocados', 'eggplant', 'corn',
+                  'peppers', 'potatoes', 'tomatoes', 'cucumbers',
+                  'raspberries', 'boysenberries', 'blackberries',
+                  'sweet onions'],
+    'July':      ['sweet corn', 'melons', 'valencia oranges', 'grapefruit',
+                  'avocados', 'tomatoes', 'grapes', 'sweet potatoes', 'beans',
+                  'raspberries', 'potatoes', 'apples', 'onions', 'peppers',
+                  'figs', 'asian pears', 'pears', 'pumpkins', 'persimmons',
+                  'macadamia nuts'],
+    'August':    ['sweet corn', 'melons', 'valencia oranges', 'grapefruit',
+                  'peaches', 'plums', 'apricots', 'avocados', 'tomatoes',
+                  'cucumbers', 'beans', 'carrots', 'squash', 'raspberries',
+                  'potatoes', 'boysenberries', 'blackberries', 'apples',
+                  'figs'],
+    'September': ['sweet corn', 'melons', 'valencia oranges', 'grapefruit',
+                  'peaches', 'plums', 'avocados', 'tomatoes', 'grapes',
+                  'squash', 'cucumbers', 'beans', 'carrots', 'raspberries',
+                  'potatoes', 'apples', 'onions', 'peppers', 'figs'],
+    'October':   ['sweet corn', 'melons', 'valencia oranges', 'grapefruit',
+                  'peaches', 'avocados', 'tomatoes', 'grapes',
+                  'sweet potatoes', 'cucumbers', 'beans', 'carrots',
+                  'potatoes', 'apples', 'onions', 'peppers', 'figs',
+                  'asian pears', 'pears'],
+    'November':  ['melons', 'valencia oranges', 'grapefruit', 'tomatoes',
+                  'sweet potatoes', 'cucumbers', 'beans', 'carrots',
+                  'raspberries', 'potatoes', 'apples', 'onions', 'peppers',
+                  'asian pears', 'pears', 'pumpkins', 'persimmons',
+                  'macadamia nuts', 'kiwis', 'lettuce'],
+    'December':  ['tangerines', 'grapefruit', 'macadamia nuts', 'avocados',
+                  'cabbages', 'cauliflower', 'broccoli', 'apples', 'kiwis',
+                  'carrots', 'beets', 'lemons', 'oranges'],
+}
+
+# Feedstock -> crop name as it appears in HARVEST_CALENDAR. None = the crop
+# is not in the table; the dryer is then sized for year-round supply
+# (12 months, i.e. no seasonal scale-up). To add seasonality for one of
+# those, either map it to a crop in the table or list its months directly
+# in FEEDSTOCK_HARVEST_MONTHS_OVERRIDE.
+FEEDSTOCK_CROP = {
+    'Tomato pomace':        'tomatoes',
+    'Almond hulls':         None,   # almonds not in the table
+    'Pistachio hulls':      None,   # pistachios not in the table
+    'Pomegranate Peel':     None,   # pomegranates not in the table
+    'Rice bran (full-fat)': None,   # rice not in the table
+}
+# Harvest windows for crops that are not in the calendar above, from the
+# SI of Breunig et al. (Resour. Conserv. Recycl., 2018; S0921344918303148),
+# Tables S7-S8, which compile USDA NASS harvesting periods. Months counted
+# the same way as the calendar table: every calendar month the harvest
+# window falls in.
+FEEDSTOCK_HARVEST_MONTHS_OVERRIDE = {
+    # Almonds, San Joaquin Valley, 15 Aug - 31 Oct (USDA 2006, 2004 data;
+    # Sacramento Valley 1 Aug - 15 Oct gives the same months).
+    'Almond hulls':         ['August', 'September', 'October'],
+    # Pistachios, San Joaquin Valley, 1 Sep - 15 Oct (USDA 2006, 2004 data).
+    'Pistachio hulls':      ['September', 'October'],
+    # Pomegranates, State, 15 Sep - 10 Nov (USDA 2006, 2004 data).
+    'Pomegranate Peel':     ['September', 'October', 'November'],
+    # Rice bran: deliberately NOT seasonal. Rice is harvested 5 Sep - 10 Nov
+    # (USDA 2010, 2009 data), but bran comes from milling, which runs
+    # year-round from stored paddy rice, so the dryer is sized for
+    # year-round supply (factor 1.0) via FEEDSTOCK_CROP = None.
+}
+
+
+def feed_harvest_season(feedstock_name):
+    """Return (months list or None, n_months) for a feedstock.
+
+    None / 12 means no seasonality data: treat the feed as available all
+    year.
+    """
+    months = FEEDSTOCK_HARVEST_MONTHS_OVERRIDE.get(feedstock_name)
+    if months is None:
+        crop = FEEDSTOCK_CROP.get(feedstock_name)
+        if crop is None:
+            return None, 12
+        months = [m for m, crops in HARVEST_CALENDAR.items()
+                  if crop.lower() in crops]
+    if not months:
+        return None, 12
+    return list(months), len(months)
+
+
+def _fmt_season(months):
+    """'May-Nov' style label for a contiguous run, else a short list."""
+    order = list(HARVEST_CALENDAR)
+    idx = sorted(order.index(m) for m in months)
+    if idx == list(range(idx[0], idx[-1] + 1)):
+        return f"{order[idx[0]][:3]}–{order[idx[-1]][:3]}"
+    return ", ".join(order[i][:3] for i in idx)
+
+
+def _stream_macros(stream, classes, to_original, exclude=()):
+    """Protein and lipid carried by a stream, by the feedstock classes.
+
+    Returns {'protein': kg/hr, 'lipid': kg/hr, 'total': kg/hr,
+             'dry_total': kg/hr} where dry_total excludes the IDs in
+    `exclude` (solvent and water).
+    """
+    out = {'protein': 0.0, 'lipid': 0.0, 'total': float(stream.F_mass),
+           'dry_total': 0.0}
+    excl = {str(x).lower() for x in exclude}
+    for chem_id, m in zip(stream.chemicals.IDs, stream.mass):
+        if m <= 0:
+            continue
+        if str(chem_id).lower() not in excl:
+            out['dry_total'] += float(m)
+        cls = classes.get(to_original(chem_id))
+        if cls in ('protein', 'lipid'):
+            out[cls] += float(m)
+    return out
+
+
+# Feed-value weights for the calculated residual price: $ value per unit of
+# fat and of protein in the price ratio below.
+RESIDUAL_PRICE_FAT_WEIGHT = 0.42
+RESIDUAL_PRICE_PROTEIN_WEIGHT = 0.023
+
+
+def _calc_residual_price(feed_price, moisture_feed, moisture_res,
+                         fat_feed, protein_feed, fat_res, protein_res):
+    """Residual price from the feed price by relative feed value:
+
+        Price_r / Price_F = (1 - Moisture_r) / (1 - Moisture_F)
+                            x (0.42 fat_r + 0.023 protein_r)
+                            / (0.42 fat_F + 0.023 protein_F)
+
+    Prices are $/kg as-is (the feed price is per kg as received, the
+    residual price per kg of dried residual). Moisture_F is the feed's
+    as-received moisture; Moisture_r is the residual's remaining solvent +
+    water. fat and protein are dry-basis mass fractions.
+
+    Returns (price $/kg, ratio Price_r/Price_F). If the feed has no fat or
+    protein (zero denominator) or is all moisture, returns (0.0, None).
+    """
+    denom = (RESIDUAL_PRICE_FAT_WEIGHT * fat_feed
+             + RESIDUAL_PRICE_PROTEIN_WEIGHT * protein_feed)
+    if denom <= 0 or moisture_feed >= 1.0:
+        return 0.0, None
+    numer = (RESIDUAL_PRICE_FAT_WEIGHT * fat_res
+             + RESIDUAL_PRICE_PROTEIN_WEIGHT * protein_res)
+    ratio = ((1.0 - moisture_res) / (1.0 - moisture_feed)) * (numer / denom)
+    return feed_price * ratio, ratio
+
+# ── Extractor solids-loading limit ──────────────────────────────────
+# The slurry entering the extractor may never exceed this mass fraction of
+# biomass, i.e. feed / (feed + solvent) <= MAX_BIOMASS_WT_FRAC. Basis is the
+# feed mass that actually reaches the extractor: the dried feed (dry solids
+# plus residual moisture) when the feed dryer is on, otherwise the feed as
+# received. Drying removes water, so less solvent is needed for the same 15%.
+MAX_BIOMASS_WT_FRAC = 0.15
+MIN_SOLV_FEED_RATIO = (1.0 - MAX_BIOMASS_WT_FRAC) / MAX_BIOMASS_WT_FRAC  # ≈ 5.667 kg/kg
+
+
+def _extractor_feed_mass(feedflow, moisture_as_received=0.0,
+                         dry_enable=False, dry_moisture=None):
+    """Feed mass (kg/hr) reaching the extractor.
+
+    With the dryer on, dry solids are conserved:
+        dried = feedflow * (1 - m_as_received) / (1 - m_target)
+    The dryer cannot add water, so a target at or above the as-received
+    moisture leaves the feed unchanged.
+    """
+    if (dry_enable and dry_moisture is not None
+            and dry_moisture < moisture_as_received and dry_moisture < 1.0):
+        return feedflow * (1.0 - moisture_as_received) / (1.0 - dry_moisture)
+    return feedflow
+
+
+def _enforce_min_solvent(solvflow, feedflow, moisture_as_received=0.0,
+                         dry_enable=False, dry_moisture=None):
+    """Raise solvflow if needed so biomass is <= MAX_BIOMASS_WT_FRAC wt%.
+
+    The limit is applied to the feed mass reaching the extractor (see
+    _extractor_feed_mass). Returns (solvflow, was_raised).
+    """
+    min_solv = MIN_SOLV_FEED_RATIO * _extractor_feed_mass(
+        feedflow, moisture_as_received, dry_enable, dry_moisture)
+    if solvflow < min_solv:
+        return min_solv, True
+    return solvflow, False
+
 
 cepci_index = {
     2010: 550.8, 2011: 585.7, 2012: 584.6, 2013: 567.3, 2014: 576.1,
@@ -1681,15 +2268,33 @@ except Exception as _price_err:
              f"Place solvent_prices.csv next to this script.")
     st.stop()
 
-porosity_torosity = {
-    'Fresh fruit and veg': 0.132,
-    'Fruit pomaces': 0.423,
-    'nuts, seeds and grains': 0.313,
-    'hulls': 0.476,
-    'stalks and straw': 0.483,
-    'leaves': 0.797,
-    'woody biomass': 0.225
-}
+# ── Deff/Dab (porosity/tortuosity factor X in the kinetics) ─────────
+# Read from the "Overal" sheet of Food_byproduct_porosity.xlsx (keep it next
+# to this script). For each feedstock: exact material match first, then the
+# average of its category, then the average of all materials if the category
+# has no data yet. See deff_lookup.py.
+from deff_lookup import load_deff_table, lookup_deff
+
+
+@st.cache_data(show_spinner=False)
+def _load_deff_table(path, mtime):
+    # mtime is part of the cache key, so editing the sheet reloads it
+    return load_deff_table(path)
+
+
+try:
+    from deff_lookup import DEFAULT_PATH as _DEFF_PATH
+    deff_table = _load_deff_table(_DEFF_PATH, os.path.getmtime(_DEFF_PATH))
+except Exception as _deff_err:
+    st.error(f"Food_byproduct_porosity.xlsx could not be loaded: {_deff_err}. "
+             f"Place Food_byproduct_porosity.xlsx next to this script.")
+    st.stop()
+
+
+def feedstock_deff(feedstock_name):
+    """Deff/Dab lookup result (dict) for a feedstock in `feedstocks`."""
+    return lookup_deff(deff_table, feedstock_name,
+                       feedstocks[feedstock_name]['type'])
 
 depreciation_options = [
     'MACRS3', 'MACRS5', 'MACRS7', 'MACRS10', 'MACRS15', 'MACRS20',
@@ -1732,6 +2337,7 @@ TEA_DEFAULTS_NTH = {
     'feed_price': 0.0,
     'feed_storage_days': 5,
     'solv_storage_days': 5,
+    'solv_disposal_price': 1.5,   # $/kg spent-solvent waste
 }
 
 TEA_DEFAULTS_FOAK = {
@@ -1763,6 +2369,7 @@ TEA_DEFAULTS_FOAK = {
     'feed_price': 0.0,
     'feed_storage_days': 5,
     'solv_storage_days': 5,
+    'solv_disposal_price': 1.5,   # $/kg spent-solvent waste
 }
 
 # Keys that the 'TEA Parameters' dropdown (Nth Plant / FOAK) controls --
@@ -1771,7 +2378,8 @@ TEA_DEFAULTS_FOAK = {
 # independently in the sidebar (from their own data sources / inputs) and
 # must NOT be overridden when a reactor choice forces FOAK in a sweep.
 _TEA_SIDEBAR_KEYS = {'operator_hourly_wage', 'elec_price', 'feed_price',
-                     'feed_storage_days', 'solv_storage_days'}
+                     'feed_storage_days', 'solv_storage_days',
+                     'solv_disposal_price'}
 TEA_MODE_KEYS = frozenset(TEA_DEFAULTS_FOAK) - _TEA_SIDEBAR_KEYS
 
 # Sidebar - Input Parameters
@@ -1807,106 +2415,9 @@ selected_feedstock = st.sidebar.selectbox(
 # (Full feedstock composition shown in main area expander)
 
 # =========================================================================
-# 2. Process Settings
+# 1a. Feedstock Drying (pre-storage)
 # =========================================================================
-st.sidebar.subheader("2. Process Settings")
-feedflow = st.sidebar.number_input(
-    "Feed Flow Rate (kg/hr)",
-    min_value=10.0, max_value=1000000.0, value=400.0, step=10.0,
-    help="Mass flow rate of feedstock entering the system."
-)
-
-solv = st.sidebar.selectbox(
-    "Solvent Type",
-    options=list(solvprice_index.keys()),
-    help="Extraction solvent used to separate target compounds from the feedstock."
-)
-
-if solv in solvprice_index:
-    st.sidebar.caption(f"Using **${solvprice_index[solv]:.4f}/kg**")
-
-solv_flow_mode = st.sidebar.radio(
-    "Solvent Flow Specification",
-    options=["Exact flow (kg/hr)", "Solvent/feed ratio"],
-    help="Specify the solvent feed either directly as a mass flow rate, or as "
-         "a mass ratio of solvent to feed. In ratio mode the solvent flow is "
-         "computed as ratio × feed flow (so it tracks the feed flow, including "
-         "when feed flow is varied in a sweep)."
-)
-
-if solv_flow_mode == "Exact flow (kg/hr)":
-    solvflow = st.sidebar.number_input(
-        "Solvent Flow Rate (kg/hr)",
-        min_value=10.0, max_value=1000000.0, value=1000.0, step=10.0,
-        help="Mass flow rate of solvent fed to the extractor."
-    )
-    solv_feed_ratio = (solvflow / feedflow) if feedflow else 0.0
-    st.sidebar.caption(
-        f"→ Solvent/feed ratio = **{solv_feed_ratio:.3g} kg/kg**"
-    )
-else:
-    solv_feed_ratio = st.sidebar.number_input(
-        "Solvent/Feed Ratio (kg/kg)",
-        min_value=0.01, max_value=1000.0, value=2.5, step=0.1,
-        help="Mass ratio of solvent to feed. The solvent flow rate is computed "
-             "as this ratio × feed flow rate."
-    )
-    solvflow = solv_feed_ratio * feedflow
-    st.sidebar.caption(
-        f"→ Solvent flow = **{solvflow:,.2f} kg/hr** "
-        f"({solv_feed_ratio:.3g} × {feedflow:,.0f} kg/hr feed)"
-    )
-
-ExtractT = st.sidebar.number_input(
-    "Solvent Temperature (°C)",
-    min_value=0.0, max_value=100.0, value=35.0, step=1.0,
-    help="Operating temperature of the solvent entering the extractor. "
-)
-
-extractt = st.sidebar.number_input(
-    "Extraction Time (hr)",
-    min_value=0.1, max_value=24.0, value=2.0, step=0.1,
-    help="Residence time of feedstock in the extractor."
-)
-
-Particlesize = st.sidebar.number_input(
-    "Particle size (cm)",
-    min_value=0.01, max_value=5.0, value=0.25, step=0.01,
-    help="Radius of feedstock particles after grinding (cm)."
-)
-
-reactor_type = st.sidebar.selectbox(
-    "Reactor Type",
-    options=['conventional', 'ultrasound', 'microwave'],
-    help="Type of extraction reactor"
-
-)
-
-heatutility = st.sidebar.selectbox(
-    "Heat Utility",
-    options=HeatU,
-    help="Choose the method for supplying heat utility"
-)
-
-pressure_mode = st.sidebar.selectbox(
-    "Pressure Mode",
-    options=["Calculated", "Custom"],
-    help="Calculated: Automatically sets pressure to 5% above the solvent's vapor pressure at extraction temperature (ensures solvent remains liquid). Custom: Manually specify operating pressure."
-)
-
-if pressure_mode == "Custom":
-    ExtractP_custom = st.sidebar.number_input(
-        "Extraction Pressure (Pa)",
-        min_value=1000.0, max_value=1000000.0, value=101325.0, step=1000.0,
-        help="Operating pressure in Pascals."
-    )
-else:
-    ExtractP_custom = None
-
-# =========================================================================
-# 2a. Feedstock Drying (pre-storage)
-# =========================================================================
-st.sidebar.subheader("2a. Feedstock Drying")
+st.sidebar.subheader("1a. Feedstock Drying")
 
 _as_received_moisture = feedstocks[selected_feedstock]['moisture']
 st.sidebar.caption(
@@ -1974,27 +2485,182 @@ feed_dry_T = st.sidebar.number_input(
     disabled=not feed_dry_enable,
 )
 
+# The evaporation / dried-feed caption needs the feed flow, which is entered
+# further down under Process Settings. Reserve its slot here so it still
+# appears in this section, and fill it once feedflow is known.
+_feed_dry_caption_slot = st.sidebar.empty()
+
+# Harvest season -> feed dryer sizing (see SeasonalDrumDryer).
+_season_months, _season_n = feed_harvest_season(selected_feedstock)
 if feed_dry_enable:
-    if feed_dry_moisture >= _as_received_moisture:
-        st.sidebar.info(
-            f"Target ({feed_dry_moisture * 100:.1f}%) is at or above the "
-            f"as-received moisture ({_as_received_moisture * 100:.1f}%) — "
-            f"the dryer will pass the feed through with no evaporation."
-        )
-    else:
-        # Wet-basis balance: dry solids are conserved.
-        _dry_solids = feedflow * (1.0 - _as_received_moisture)
-        _dried_feed = _dry_solids / (1.0 - feed_dry_moisture)
-        _water_out = feedflow - _dried_feed
+    if _season_months:
         st.sidebar.caption(
-            f"→ Evaporates **{_water_out:,.1f} kg/hr** water; "
-            f"**{_dried_feed:,.1f} kg/hr** to storage"
-        )
+            f"Harvest season: **{_fmt_season(_season_months)}** "
+            f"({_season_n} of 12 months) → feed dryer sized for "
+            f"**{12 / _season_n:.2f}×** the average feed rate.")
+    else:
+        st.sidebar.caption(
+            f"No harvest-season data for {selected_feedstock} — feed "
+            f"dryer sized for year-round supply.")
 
 # Dried feed is cooled to ambient before it enters the storage tank —
 # storing hot dried biomass causes condensation on the tank walls and
 # re-wetting of the pile.
 FEED_COOL_T = 298.15  # K (25 °C)
+
+# =========================================================================
+# 2. Process Settings
+# =========================================================================
+st.sidebar.subheader("2. Process Settings")
+feedflow = st.sidebar.number_input(
+    "Feed Flow Rate (kg/hr)",
+    min_value=10.0, max_value=1000000.0, value=400.0, step=10.0,
+    help="Mass flow rate of feedstock entering the system."
+)
+
+solv = st.sidebar.selectbox(
+    "Solvent Type",
+    options=list(solvprice_index.keys()),
+    help="Extraction solvent used to separate target compounds from the feedstock."
+)
+
+if solv in solvprice_index:
+    st.sidebar.caption(f"Using **${solvprice_index[solv]:.4f}/kg**")
+
+solv_flow_mode = st.sidebar.radio(
+    "Solvent Flow Specification",
+    options=["Exact flow (kg/hr)", "Solvent/feed ratio"],
+    help="Specify the solvent feed either directly as a mass flow rate, or as "
+         "a mass ratio of solvent to feed. In ratio mode the solvent flow is "
+         "computed as ratio × feed flow (so it tracks the feed flow, including "
+         "when feed flow is varied in a sweep)."
+)
+
+# Feed mass that actually reaches the extractor: the dried feed when the
+# dryer is on, otherwise the feed as received. The 15 wt% biomass limit is
+# applied to this mass, so drying lowers the minimum solvent required.
+_extractor_feed = _extractor_feed_mass(
+    feedflow, _as_received_moisture, feed_dry_enable, feed_dry_moisture)
+_min_ratio_asrec = (MIN_SOLV_FEED_RATIO * _extractor_feed / feedflow
+                    if feedflow else MIN_SOLV_FEED_RATIO)
+_basis_txt = ("dried feed" if _extractor_feed < feedflow - 1e-9
+              else "feed as received")
+
+# Fill the drying-section caption reserved above.
+if feed_dry_enable:
+    if feed_dry_moisture >= _as_received_moisture:
+        _feed_dry_caption_slot.info(
+            f"Target ({feed_dry_moisture * 100:.1f}%) is at or above the "
+            f"as-received moisture ({_as_received_moisture * 100:.1f}%) — "
+            f"the dryer will pass the feed through with no evaporation."
+        )
+    else:
+        _feed_dry_caption_slot.caption(
+            f"→ Evaporates **{feedflow - _extractor_feed:,.1f} kg/hr** "
+            f"water; **{_extractor_feed:,.1f} kg/hr** to storage"
+        )
+
+if solv_flow_mode == "Exact flow (kg/hr)":
+    solvflow = st.sidebar.number_input(
+        "Solvent Flow Rate (kg/hr)",
+        min_value=10.0, max_value=1000000.0, value=2500.0, step=10.0,
+        help="Mass flow rate of solvent fed to the extractor. If this is "
+             f"below {MIN_SOLV_FEED_RATIO:.3f} × the feed mass reaching the "
+             f"extractor (the dried feed when the feed dryer is on), it is "
+             f"raised to that minimum so the extractor never exceeds "
+             f"{MAX_BIOMASS_WT_FRAC:.0%} wt biomass."
+    )
+    solvflow, _solv_raised = _enforce_min_solvent(
+        solvflow, feedflow, _as_received_moisture,
+        feed_dry_enable, feed_dry_moisture)
+    if _solv_raised:
+        st.sidebar.warning(
+            f"Solvent flow raised to **{solvflow:,.2f} kg/hr** so the "
+            f"extractor never exceeds {MAX_BIOMASS_WT_FRAC:.0%} wt biomass "
+            f"({MIN_SOLV_FEED_RATIO:.3f} kg/kg × {_extractor_feed:,.1f} "
+            f"kg/hr {_basis_txt})."
+        )
+    solv_feed_ratio = (solvflow / feedflow) if feedflow else 0.0
+    st.sidebar.caption(
+        f"→ Solvent/feed ratio = **{solv_feed_ratio:.3g} kg/kg** "
+        f"(minimum {_min_ratio_asrec:.3f} kg/kg on feed as received)"
+    )
+else:
+    solv_feed_ratio = st.sidebar.number_input(
+        "Solvent/Feed Ratio (kg/kg)",
+        min_value=float(round(_min_ratio_asrec, 3)), max_value=1000.0,
+        value=float(max(6.0, round(_min_ratio_asrec, 3))), step=0.1,
+        format="%.3f",
+        help="Mass ratio of solvent to feed as received. The solvent flow "
+             "rate is computed as this ratio × feed flow rate. The minimum "
+             f"({_min_ratio_asrec:.3f} kg/kg here) keeps the extractor at or "
+             f"below {MAX_BIOMASS_WT_FRAC:.0%} wt biomass; it is "
+             f"{MIN_SOLV_FEED_RATIO:.3f} kg/kg on the feed reaching the "
+             f"extractor, so it drops when the feed dryer is on."
+    )
+    solvflow = solv_feed_ratio * feedflow
+    # Guard against rounding of the widget minimum.
+    solvflow, _ = _enforce_min_solvent(
+        solvflow, feedflow, _as_received_moisture,
+        feed_dry_enable, feed_dry_moisture)
+    st.sidebar.caption(
+        f"→ Solvent flow = **{solvflow:,.2f} kg/hr** "
+        f"({solv_feed_ratio:.3g} × {feedflow:,.0f} kg/hr feed)"
+    )
+
+ExtractT = st.sidebar.number_input(
+    "Solvent Temperature (°C)",
+    min_value=0.0, max_value=100.0, value=35.0, step=1.0,
+    help="Operating temperature of the solvent entering the extractor. "
+)
+
+extractt = st.sidebar.number_input(
+    "Extraction Time (hr)",
+    min_value=0.1, max_value=24.0, value=2.0, step=0.1,
+    help="Total residence time of feedstock in the extractor. The extractor "
+         "is modelled as 5 CSTRs in series (each 1/5 of this time) followed "
+         "by a centrifuge; 6% of the feed bypasses extraction and leaves "
+         "untouched in the residual."
+)
+
+Particlesize = st.sidebar.number_input(
+    "Particle radius (cm)",
+    min_value=MIN_PARTICLE_RADIUS, max_value=5.0, value=0.25, step=0.01,
+    format="%.4f",
+    help="Radius of feedstock particles after grinding (cm). Minimum "
+         f"{MIN_PARTICLE_RADIUS} cm (0.35 mm diameter): below this size "
+         "extraction is limited by diffusion through cell walls "
+         "(Lomovskiy et al. 2020), so the kinetic model does not apply."
+)
+
+reactor_type = st.sidebar.selectbox(
+    "Reactor Type",
+    options=['conventional', 'ultrasound', 'microwave'],
+    help="Type of extraction reactor"
+
+)
+
+heatutility = st.sidebar.selectbox(
+    "Heat Utility",
+    options=HeatU,
+    help="Choose the method for supplying heat utility"
+)
+
+pressure_mode = st.sidebar.selectbox(
+    "Pressure Mode",
+    options=["Calculated", "Custom"],
+    help="Calculated: Automatically sets pressure to 5% above the solvent's vapor pressure at extraction temperature (ensures solvent remains liquid). Custom: Manually specify operating pressure."
+)
+
+if pressure_mode == "Custom":
+    ExtractP_custom = st.sidebar.number_input(
+        "Extraction Pressure (Pa)",
+        min_value=1000.0, max_value=1000000.0, value=101325.0, step=1000.0,
+        help="Operating pressure in Pascals."
+    )
+else:
+    ExtractP_custom = None
+
 
 # =========================================================================
 # 2b. Post-Extraction Concentration Settings
@@ -2010,17 +2676,198 @@ evap_target_solids = st.sidebar.slider(
     min_value=10, max_value=50, value=45, step=5,
     help="Target solids fraction leaving the evaporator. Max 50% due to viscosity limits [Tanguy et al. 2015]."
 ) / 100.0
-dryer_moisture = st.sidebar.slider(
-    "Dryer Residual Solvent (wt%)",
-    min_value=0.1, max_value=20.0, value=5.0, step=0.1, format="%.1f",
-    help="Residual solvent in the final dried product."
-) / 100.0
+# ---- Target residual solvent in the product -----------------------------
+# One target sets both the product dryer and the powder desolventizer:
+#   * the product dryer (spray / vacuum drum) is taken no lower than
+#     DRYER_MIN_RESIDUAL (2 wt%);
+#   * if the target is below that, the powder desolventizer (D401) is added
+#     and polishes the powder from 2 wt% down to the target;
+#   * if the target is at or above 2 wt%, the dryer goes straight to the
+#     target and no desolventizer is built.
+# "Legal maximum" picks the target from the selected solvent's residue limit;
+# solvents with no limit (water, ethanol) stop at the dryer's 2 wt%.
+DRYER_MIN_RESIDUAL = 0.02   # wt frac, lowest residual solvent the dryer reaches
+
+# Residual-solvent limits in the extract, ppm (w/w), for two product uses.
+# None = no limit; NOT_PERMITTED = the solvent may not be used at all.
+#   hexane  25 ppm -- 21 CFR 173.270 (spice oleoresins)
+#   acetone 30 ppm -- 21 CFR 173.210 (spice oleoresins)
+#   chloroform -- not permitted as a food extraction solvent; 60 ppm for
+#       pharma (ICH Q3C Class 2)
+#   water, ethanol -- no residue limit
+NOT_PERMITTED = 'not permitted'
+LEGAL_SOLVENT_LIMIT_PPM = {
+    'food': {
+        'hexane': 25.0,
+        'acetone': 30.0,
+        'chloroform': NOT_PERMITTED,
+        'water': None,
+        'ethanol': None,
+    },
+    'pharma': {
+        'hexane': 25.0,
+        'acetone': 30.0,
+        'chloroform': 60.0,
+        'water': None,
+        'ethanol': None,
+    },
+}
+SOLVENT_TARGET_MODES = ("Legal limit — food", "Legal limit — pharma",
+                        "Custom")
+_MODE_FROM_LABEL = {"Legal limit — food": 'legal_food',
+                    "Legal limit — pharma": 'legal_pharma',
+                    "Custom": 'custom'}
+
+
+def _legal_limit_ppm(solvent, use='food'):
+    """Residue limit in ppm, None (no limit / unknown) or NOT_PERMITTED."""
+    return LEGAL_SOLVENT_LIMIT_PPM[use].get(str(solvent).strip().lower())
+
+
+def _resolve_solvent_target(solvent, mode, custom_ppm=None):
+    """Return (target_frac, dryer_frac, desolv_enable, basis_text).
+
+    mode: 'legal_food', 'legal_pharma' or 'custom' ('legal' = food, kept
+    for older saved params). target_frac is None when the solvent is not
+    permitted for that use; the run is then refused.
+    """
+    if mode == 'legal':
+        mode = 'legal_food'
+    if mode in ('legal_food', 'legal_pharma'):
+        use = 'food' if mode == 'legal_food' else 'pharma'
+        lim = _legal_limit_ppm(solvent, use)
+        if lim == NOT_PERMITTED:
+            return (None, DRYER_MIN_RESIDUAL, False,
+                    f"{solvent} is not permitted for {use}")
+        if lim is None:
+            target = DRYER_MIN_RESIDUAL
+            known = (str(solvent).strip().lower()
+                     in LEGAL_SOLVENT_LIMIT_PPM[use])
+            basis = (f"no {use} residue limit for {solvent}" if known else
+                     f"no {use} limit on file for {solvent}")
+        else:
+            target = lim * 1e-6
+            basis = f"{use} legal limit for {solvent} ({lim:g} ppm)"
+    else:
+        target = max(float(custom_ppm or 0.0), 0.1) * 1e-6
+        basis = "custom target"
+    dryer_frac = max(target, DRYER_MIN_RESIDUAL)
+    desolv_on = target < DRYER_MIN_RESIDUAL * (1 - 1e-9)
+    return target, dryer_frac, desolv_on, basis
+
+
+solvent_target_source = st.sidebar.radio(
+    "Target residual solvent in product",
+    options=SOLVENT_TARGET_MODES,
+    help=("Sets the solvent left in the final product. The product dryer "
+          f"goes no lower than {DRYER_MIN_RESIDUAL:.0%} wt; any target "
+          "below that adds the powder desolventizer to polish it down. "
+          "Legal limits: hexane 25 ppm (21 CFR 173.270), acetone 30 ppm "
+          "(21 CFR 173.210), no limit for water or ethanol (those stop at "
+          f"the dryer's {DRYER_MIN_RESIDUAL:.0%} wt). Chloroform: not "
+          "permitted for food; 60 ppm for pharma (ICH Q3C)."),
+)
+solvent_target_mode = _MODE_FROM_LABEL[solvent_target_source]
+if solvent_target_mode == 'custom':
+    _tc1, _tc2 = st.sidebar.columns([2, 1])
+    with _tc2:
+        solvent_target_unit = st.selectbox(
+            "Units", options=["ppm", "wt%"], key="solvent_target_unit")
+    with _tc1:
+        if solvent_target_unit == "ppm":
+            solvent_target_ppm = st.number_input(
+                "Target (ppm)", min_value=1.0, max_value=200000.0,
+                value=25.0, step=5.0, format="%.1f",
+                key="solvent_target_value_ppm")
+        else:
+            solvent_target_ppm = st.number_input(
+                "Target (wt%)", min_value=0.0001, max_value=20.0,
+                value=5.0, step=0.5, format="%.4f",
+                key="solvent_target_value_wt") * 1e4
+else:
+    solvent_target_unit = "ppm"
+    solvent_target_ppm = None
+
+(_solv_target_frac, dryer_moisture, desolv_enable,
+ _solv_target_basis) = _resolve_solvent_target(
+    solv, solvent_target_mode, solvent_target_ppm)
+solvent_not_permitted = _solv_target_frac is None
+desolv_target_ppm = (DRYER_MIN_RESIDUAL if solvent_not_permitted
+                     else _solv_target_frac) * 1e6
+if solvent_target_ppm is None:
+    # Central value for the sweep / sensitivity panels.
+    solvent_target_ppm = desolv_target_ppm
+if solvent_not_permitted:
+    st.sidebar.error(
+        f"⛔ {_solv_target_basis.capitalize()}. Pick another solvent or "
+        f"target; a run with this combination stops with an error.")
+elif desolv_enable:
+    st.sidebar.caption(
+        f"→ Target **{desolv_target_ppm:,.1f} ppm** ({_solv_target_basis}): "
+        f"product dryer to {dryer_moisture:.0%} wt, then the **powder "
+        f"desolventizer** polishes to the target.")
+else:
+    st.sidebar.caption(
+        f"→ Target **{dryer_moisture:.2%} wt** ({_solv_target_basis}): "
+        f"product dryer only, no desolventizer.")
+DRYER_TYPES = ["Spray dryer", "Vacuum drum dryer"]
+dryer_type = st.sidebar.selectbox(
+    "Product Dryer Type",
+    options=DRYER_TYPES,
+    index=0,
+    help=("Spray dryer: outlet at solvent Tb + 10 K, 21.8 % thermal "
+          "efficiency [Patel & Bade 2019]. Vacuum drum dryer: low-temperature "
+          "(40-80 °C) drying for heat-sensitive products; energy and cost "
+          "from ECN-E--17-084 (de Smidt et al. 2017).")
+)
+if dryer_type == "Vacuum drum dryer":
+    vdd_T_C = st.sidebar.slider(
+        "Vacuum Drum Dryer Temperature (°C)",
+        min_value=VDD_T_MIN_C, max_value=VDD_T_MAX_C,
+        value=VDD_T_DEFAULT_C, step=1.0, format="%.0f",
+        help=("Product / vapour temperature, limited to 40-80 °C "
+              "[Wageningen FBR, 'Drying of bio refinery product streams']. "
+              "Pressure is calculated: the solvent's vapour pressure at this "
+              "temperature × 0.251 (ECN: 0.05 bar vs 0.199 bar for water "
+              "at 60 °C), capped at 1 atm.")
+    )
+    try:
+        _vdd_Psat = tmo.Chemical(solv).Psat(vdd_T_C + 273.15)
+    except Exception:
+        _vdd_Psat = None   # solvent not resolvable here; unit still computes it
+    if _vdd_Psat:
+        _vdd_P = min(VDD_P_ECN / tmo.Chemical('Water').Psat(333.15) * _vdd_Psat,
+                     VDD_P_ATM)
+        st.sidebar.caption(f"→ Operating pressure **{_vdd_P/1e3:,.1f} kPa**"
+                           + (" (atmospheric, no vacuum)" if _vdd_P >= VDD_P_ATM else ""))
+else:
+    vdd_T_C = None   # not used by the spray dryer
+
+# ---- Final solvent polishing (powder desolventizer, after the dryer) ----
+# Agitated vacuum contact dryer that takes the dried powder from the product
+# dryer's residual solvent down to a ppm target (e.g. 25 ppm hexane, 21 CFR
+# 173.270). See PowderDesolventizer.py and the explanation document.
+# The desolventizer is switched on by the residual-solvent target above
+# (desolv_enable / desolv_target_ppm). Its sizing assumptions (drying time,
+# jacket temperature, bulk density, fill fraction) are fixed background
+# values from DESOLV_DEFAULTS in PowderDesolventizer.py -- not user inputs.
+desolv_residence_h = float(DESOLV_DEFAULTS['residence_time'])
+desolv_T_C = float(DESOLV_DEFAULTS['T_C'])
+desolv_bulk_density = float(DESOLV_DEFAULTS['bulk_density'])
+desolv_fill_fraction = float(DESOLV_DEFAULTS['fill_fraction'])
+if desolv_enable and not perry_cost_data_ready():
+    st.sidebar.error(
+        "Perry's Table 12-28 cost data has not been entered in "
+        "PowderDesolventizer.py (PERRY_12_28). The run will stop with an "
+        "error until it is filled in.")
 
 # Cooling settings (hardcoded — no user input needed)
 solid_cooler_U = 25  # W/(m²·K), typical for indirect rotary coolers
                      # with organic powders (Nhuchhen et al. 2016; Perry's §11)
 
-# Feedstock drum-dryer settings (hardcoded — no user input needed)
+# Residual drum-dryer (SD2, FeedDrumDryer) settings (hardcoded — no user
+# input needed). The feedstock dryer D101 is the stock bst.DrumDryer and
+# uses BioSTEAM's defaults instead.
 feed_dryer_efficiency = 0.70  # fraction of supplied heat reaching the solids;
                               # typical for indirect steam-tube rotary dryers
                               # (Mujumdar, Handbook of Industrial Drying, Ch. 2)
@@ -2098,7 +2945,7 @@ with col1:
 with col2:
     feed_storage_days = st.number_input(
         "Feed Storage (days)",
-        min_value=1, max_value=30, value=TEA_DEFAULTS_NTH['feed_storage_days'],
+        min_value=1, max_value=365, value=TEA_DEFAULTS_NTH['feed_storage_days'],
         help="Days of feedstock inventory to maintain on-site."
     )
     solv_storage_days = st.number_input(
@@ -2189,6 +3036,51 @@ if solv_price_source == "Custom":
     )
 else:
     solv_price_input = None
+
+# ---- Solvent disposal cost -----------------------------------------------
+# Charged per kg of spent-solvent waste leaving the plant: the recycle purge
+# when recycle is on, or the evaporator condensate + dryer vapour when it is
+# off (once-through, so all recovered solvent is waste).
+solv_disposal_price = st.sidebar.number_input(
+    "Solvent Disposal Cost ($/kg)",
+    min_value=0.0, max_value=100.0,
+    value=float(TEA_DEFAULTS_NTH['solv_disposal_price']),
+    step=0.1, format="%.4f",
+    help="Cost to dispose of spent solvent per kg of waste stream. Applied "
+         "to the recycle purge (recycle on) or to the evaporator condensate "
+         "and dryer vapour (recycle off). Default $1.50/kg.",
+)
+
+# ---- Residual selling price ---------------------------------------------
+# Price received for the dried extraction residual (spent biomass), sold as
+# a co-product. Its revenue lowers the product's minimum selling price.
+residual_price_source = st.sidebar.radio(
+    "Residual price source",
+    options=("Calculated from feed price", "Custom"),
+    help="Calculated prices the dried residual off the feed price by its "
+         "feed value: Price_r / Price_F = (1 − Moisture_r)/(1 − Moisture_F) "
+         "× (0.42·fat_r + 0.023·protein_r)/(0.42·fat_F + 0.023·protein_F), "
+         "with fat and protein on a dry basis from the simulated streams. "
+         "It follows the feed price, so with a $0/kg feed the residual is "
+         "also $0/kg. Custom lets you enter your own $/kg (needed to sweep "
+         "the residual price or include it in a sensitivity analysis).",
+)
+residual_price_mode = ('calculated' if residual_price_source.startswith(
+    "Calculated") else 'custom')
+if residual_price_mode == 'custom':
+    residual_price = st.sidebar.number_input(
+        "Residual Selling Price ($/kg)",
+        min_value=0.0, max_value=1000.0,
+        value=0.0, step=0.01, format="%.4f",
+        help="Price received per kg of dried residual (spent biomass leaving "
+             "the residual dryer), sold as a co-product. Its revenue is "
+             "credited in the TEA and lowers the product's minimum selling "
+             "price. Default $0/kg (residual given away).",
+    )
+else:
+    residual_price = None   # computed per run from the feed price
+    st.sidebar.caption("Residual price is calculated per run from the feed "
+                       "price and the residual's fat, protein and moisture.")
 
 # TEA Parameters — Default / Custom toggle
 # Ultrasound-assisted extraction is a first-of-a-kind (FOAK) process, so the
@@ -2423,12 +3315,16 @@ NUMERIC_SWEEP_SPECS = {
     'solvflow':        {'label': 'Solvent flow rate (kg/hr)',        'min': 10.0,   'max': 1000000.0, 'def_lo': 500.0,    'def_hi': 2000.0,   'fmt': '%.2f',  'cast': None, 'group': 'Process'},
     'ExtractT':        {'label': 'Extraction temperature (°C)',       'min': 0.0,    'max': 100.0,     'def_lo': 25.0,     'def_hi': 65.0,     'fmt': '%.2f',  'cast': None, 'group': 'Process'},
     'extractt':        {'label': 'Extraction time (hr)',              'min': 0.1,    'max': 24.0,      'def_lo': 0.5,      'def_hi': 4.0,      'fmt': '%.3f',  'cast': None, 'group': 'Process'},
-    'Particlesize':    {'label': 'Particle radius (cm)',              'min': 0.01,   'max': 5.0,       'def_lo': 0.1,      'def_hi': 1.0,      'fmt': '%.4f',  'cast': None, 'group': 'Process'},
+    'Particlesize':    {'label': 'Particle radius (cm)',              'min': MIN_PARTICLE_RADIUS, 'max': 5.0,       'def_lo': 0.1,      'def_hi': 1.0,      'fmt': '%.4f',  'cast': None, 'group': 'Process'},
     'ExtractP_custom': {'label': 'Extraction pressure (Pa, Custom mode)', 'min': 1000.0,'max': 1000000.0,'def_lo': 50000.0,'def_hi': 300000.0,'fmt': '%.0f', 'cast': None, 'group': 'Process'},
     # Concentration / drying
     'evap_n_effects':     {'label': 'Evaporator effects',             'min': 1,      'max': 5,         'def_lo': 1,        'def_hi': 5,        'fmt': '%d',    'cast': int,  'group': 'Concentration'},
     'evap_target_solids': {'label': 'Evaporator target solids (frac)','min': 0.10,   'max': 0.50,      'def_lo': 0.20,     'def_hi': 0.45,     'fmt': '%.3f',  'cast': None, 'group': 'Concentration'},
-    'dryer_moisture':     {'label': 'Dryer residual solvent (frac)',  'min': 0.001,  'max': 0.20,      'def_lo': 0.02,     'def_hi': 0.10,     'fmt': '%.4f',  'cast': None, 'group': 'Concentration'},
+    # Residual solvent in the product (ppm). Varying it switches the run to
+    # a custom target; below 20,000 ppm (2 wt%) it adds the desolventizer.
+    'solvent_target_ppm': {'label': 'Target residual solvent (ppm)',  'min': 1.0,    'max': 200000.0,  'def_lo': 25.0,     'def_hi': 50000.0,  'fmt': '%.1f',  'cast': None, 'group': 'Concentration'},
+    # Only used when the vacuum drum dryer is selected; limits = input limits.
+    'vdd_T_C':            {'label': 'Vacuum drum dryer temperature (°C)', 'min': VDD_T_MIN_C, 'max': VDD_T_MAX_C, 'def_lo': 40.0, 'def_hi': 80.0, 'fmt': '%.1f', 'cast': None, 'group': 'Concentration'},
     # Recycle
     'recycle_x_max':      {'label': 'Max impurity frac at inlet',      'min': 0.001,  'max': 0.20,      'def_lo': 0.005,    'def_hi': 0.05,     'fmt': '%.4f',  'cast': None, 'group': 'Recycle'},
     # Economics
@@ -2436,8 +3332,10 @@ NUMERIC_SWEEP_SPECS = {
     'feed_price':         {'label': 'Feed price ($/kg)',                'min': 0.0,    'max': 100.0,     'def_lo': 0.0,      'def_hi': 0.50,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
     'operator_hourly_wage': {'label': 'Operator wage ($/hr)',           'min': 0.0,    'max': 200.0,     'def_lo': 18.0,     'def_hi': 35.0,     'fmt': '%.2f',  'cast': None, 'group': 'Economics'},
     'operators_per_shift':  {'label': 'Operators per shift',            'min': 1,      'max': 50,        'def_lo': 3,        'def_hi': 10,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
+    'solv_disposal_price': {'label': 'Solvent disposal cost ($/kg)',   'min': 0.0,    'max': 100.0,     'def_lo': 0.50,     'def_hi': 3.00,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
+    'residual_price':     {'label': 'Residual selling price ($/kg)',    'min': 0.0,    'max': 1000.0,    'def_lo': 0.0,      'def_hi': 0.20,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
     'solv_price':         {'label': 'Solvent price ($/kg)',             'min': 0.0,    'max': 1000.0,    'def_lo': 0.50,     'def_hi': 3.00,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
-    'feed_storage_days':  {'label': 'Feed storage (days)',              'min': 1,      'max': 30,        'def_lo': 3,        'def_hi': 14,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
+    'feed_storage_days':  {'label': 'Feed storage (days)',              'min': 1,      'max': 365,        'def_lo': 3,        'def_hi': 14,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
     'solv_storage_days':  {'label': 'Solvent storage (days)',           'min': 1,      'max': 30,        'def_lo': 3,        'def_hi': 14,       'fmt': '%d',    'cast': int,  'group': 'Economics'},
     # TEA
     'IRR':                {'label': 'IRR',                              'min': 0.0,    'max': 1.0,       'def_lo': 0.05,     'def_hi': 0.25,     'fmt': '%.3f',  'cast': None, 'group': 'TEA'},
@@ -2467,6 +3365,7 @@ CATEGORICAL_SWEEP_SPECS = {
     'selected_feedstock': {'label': 'Feedstock',     'options': list(feedstocks.keys())},
     'solv':               {'label': 'Solvent',       'options': list(solvprice_index.keys())},
     'reactor_type':       {'label': 'Reactor type',  'options': ['conventional', 'ultrasound', 'microwave']},
+    'dryer_type':         {'label': 'Product dryer', 'options': DRYER_TYPES},
     'heatutility':        {'label': 'Heat utility',  'options': HeatU},
     'depreciation':       {'label': 'Depreciation',  'options': depreciation_options},
 }
@@ -2488,7 +3387,8 @@ operators_per_shift = operators_per_shift_input
 
 # Sidebar display order for the numeric parameter groups (shared by the
 # Parameter Sweep and Sensitivity Analysis configuration panels).
-SWEEP_GROUPS_ORDERED = ['Process', 'Feed drying', 'Concentration', 'Recycle',
+SWEEP_GROUPS_ORDERED = ['Process', 'Feed drying', 'Concentration',
+                        'Recycle',
                         'Economics', 'TEA']
 
 if sim_mode == "Parameter Sweep":
@@ -2821,20 +3721,75 @@ with st.expander("🌿 Feedstock Composition — " + selected_feedstock, expande
         st.write(f"**Feedstock Type:** {fs_info['type']}")
         st.write(f"**Moisture Content:** {fs_info['moisture'] * 100:.1f}%")
         st.write(f"**Number of Components:** {len(fs_info['chems'])}")
+        _dl = feedstock_deff(selected_feedstock)
+        st.write(f"**Deff/Dab:** {_dl['value']:.4f} ({_dl['basis']})")
+        if _dl['basis'] == 'stand-in category':
+            st.info(_dl['note'] + ".")
+        elif _dl['basis'] == 'overall':
+            st.warning("No porosity data for this feedstock or its category "
+                       "— " + _dl['note'] + ".")
+        else:
+            st.caption(_dl['note'])
     with col_b:
         st.write(f"**Dry-basis composition shown in mg/g**")
 
-    # Build composition table with name next to value (mg/g)
+    # Build composition table with name next to value (mg/g). Fill-in model
+    # compounds and the balance term are shown by their output labels
+    # ('Undefined protein', 'Undefined lipid', 'Unknown').
+    _labels = MACRO_LABELS.get(selected_feedstock, {})
     comp_table = []
     for entry, comp_val in zip(fs_info['chems'], fs_info['comp']):
         chem_name = _get_chem_name(entry)
         mg_per_g = comp_val * 1000  # convert mass fraction to mg/g
         comp_table.append({
-            'Chemical': chem_name,
+            'Chemical': _labels.get(chem_name, chem_name),
             'Composition (mg/g)': _fmt_mg_g(mg_per_g),
         })
+    _macro = MACRO_REPORTS.get(selected_feedstock)
+
     df_feedstock = pd.DataFrame(comp_table)
     st.dataframe(df_feedstock, use_container_width=True, hide_index=True, height=500)
+
+    if _macro and _macro.get('error'):
+        st.error("Protein/lipid accounting failed for this feedstock — "
+                 "composition used as listed. " + _macro['error'])
+    elif _macro:
+        st.markdown("**Protein & lipid accounting** (dry basis)")
+        st.dataframe(pd.DataFrame([{
+            'Component': s['component'].capitalize(),
+            'Reported total (mg/g)': f"{s['reported_total_mg_g']:.1f}",
+            'Measured compounds (mg/g)': f"{s['measured_sum_mg_g']:.1f}",
+            '# measured': s['n_measured_compounds'],
+            'Model compound added (mg/g)': f"{s['filler_mg_g']:.1f}",
+            'Added as': (f"{_labels.get(s['model_compound'], s['model_compound'])}"
+                         f" (proxy: {s['model_compound']})"
+                         if s['model_compound'] else '—'),
+            'Total in model (mg/g)': f"{s['model_total_mg_g']:.1f}",
+        } for s in _macro['summary']]),
+            use_container_width=True, hide_index=True)
+        st.caption(
+            f"Where measured compounds fall short of the reported total, the "
+            f"shortfall is added as a model compound, shown as Undefined "
+            f"protein / Undefined lipid. {_macro['balance']} is then "
+            f"recomputed as the balance, shown as Unknown (listed "
+            f"{_macro['listed_balance_mg_g']:.1f} → "
+            f"{_macro['balance_mg_g']:.1f} mg/g). "
+            f"Where they exceed it, the measured compounds are kept and "
+            f"nothing is added, so the total in the model is the larger of "
+            f"the measured sum and the reported total. Lipid scope: "
+            f"{'all ChEBI lipids' if _macro['lipid_scope'] == 'all' else 'fatty acids and glycerides only'}.")
+        # A checkbox, not an expander: this already sits inside the
+        # Feedstock Composition expander, and Streamlit forbids nesting them.
+        if st.checkbox("Show how each compound was classified",
+                       key="show_macro_classification"):
+            st.dataframe(pd.DataFrame([{
+                'Compound': (f"{_labels[r['compound']]} ({r['compound']})"
+                             if r['compound'] in _labels else r['compound']),
+                'Class': r['class'],
+                'Decided by': r['source'],
+                'mg/g': _fmt_mg_g(r['mass_frac'] * 1000)}
+                for r in _macro['compounds']]),
+                use_container_width=True, hide_index=True)
 
 # Main content area
 def _run_one_simulation(p, *, display=True):
@@ -2870,9 +3825,22 @@ def _run_one_simulation(p, *, display=True):
         _ratio = p.get('solv_feed_ratio')
         if _ratio is not None:
             solvflow = _ratio * feedflow
+    # Hard floor: never more than MAX_BIOMASS_WT_FRAC wt% biomass in the
+    # extractor. Applies to every run, including sweeps of feed flow,
+    # solvent flow or ratio, and params dicts saved before this limit.
+    # Applied to the feed mass reaching the extractor, so the per-run
+    # feedstock and drying settings (which may be swept) set the minimum.
+    solvflow, _solv_raised = _enforce_min_solvent(
+        solvflow, feedflow,
+        feedstocks[p['selected_feedstock']]['moisture'],
+        p.get('feed_dry_enable', True),
+        p.get('feed_dry_moisture', 0.06))
     ExtractT                = p['ExtractT']
     extractt                = p['extractt']
-    Particlesize            = p['Particlesize']
+    # Saved or swept parameter sets may hold a radius below the kinetic
+    # model's minimum (0.35 mm diameter); raise it to the minimum so the
+    # extractor (which rejects smaller radii) and the mill use the same size.
+    Particlesize            = max(float(p['Particlesize']), MIN_PARTICLE_RADIUS)
     reactor_type            = p['reactor_type']
     heatutility             = p['heatutility']
     pressure_mode           = p['pressure_mode']
@@ -2882,7 +3850,43 @@ def _run_one_simulation(p, *, display=True):
     feed_dry_T              = p.get('feed_dry_T', 90.0)
     evap_n_effects          = int(p['evap_n_effects'])
     evap_target_solids      = p['evap_target_solids']
-    dryer_moisture          = p['dryer_moisture']
+    # Residual-solvent target -> dryer setting + desolventizer on/off.
+    # Resolved per run so a solvent sweep picks up each solvent's legal
+    # limit. Older params dicts (dryer_moisture / desolv_enable) still work.
+    solvent_target_mode     = p.get('solvent_target_mode')
+    if solvent_target_mode is not None:
+        (_target_frac, dryer_moisture, desolv_enable,
+         solvent_target_basis) = _resolve_solvent_target(
+            solv, solvent_target_mode, p.get('solvent_target_ppm'))
+        if _target_frac is None:
+            # Solvent not permitted for this use (e.g. chloroform, food).
+            # In a sweep this run is recorded as failed with this reason.
+            _msg = (f"{solvent_target_basis.capitalize()}: no legal "
+                    f"residual level exists, so this solvent/use "
+                    f"combination is not simulated.")
+            if display:
+                st.error("⛔ " + _msg)
+                return None
+            raise ValueError(_msg)
+        desolv_target_ppm = _target_frac * 1e6
+    else:
+        dryer_moisture = p['dryer_moisture']
+        desolv_enable = bool(p.get('desolv_enable', False))
+        desolv_target_ppm = float(p.get('desolv_target_ppm',
+                                        DESOLV_DEFAULTS['target_ppm']))
+        solvent_target_basis = 'dryer setting'
+    dryer_type              = p.get('dryer_type', 'Spray dryer')
+    vdd_T_C                 = p.get('vdd_T_C')
+    if vdd_T_C is None:
+        vdd_T_C = VDD_T_DEFAULT_C
+    desolv_residence_h      = float(p.get('desolv_residence_h',
+                                          DESOLV_DEFAULTS['residence_time']))
+    desolv_T_C              = float(p.get('desolv_T_C',
+                                          DESOLV_DEFAULTS['T_C']))
+    desolv_bulk_density     = float(p.get('desolv_bulk_density',
+                                          DESOLV_DEFAULTS['bulk_density']))
+    desolv_fill_fraction    = float(p.get('desolv_fill_fraction',
+                                          DESOLV_DEFAULTS['fill_fraction']))
     enable_recycle          = p['enable_recycle']
     recycle_x_max           = p['recycle_x_max']
     Yearstart               = p['Yearstart']
@@ -2891,6 +3895,11 @@ def _run_one_simulation(p, *, display=True):
     feed_storage_days       = int(p['feed_storage_days'])
     solv_storage_days       = int(p['solv_storage_days'])
     operator_hourly_wage    = p['operator_hourly_wage']
+    solv_disposal_price     = float(p.get('solv_disposal_price', 1.5))
+    # 'calculated' -> priced off the feed (set after the simulation);
+    # 'custom' -> the value given. Older params dicts default to custom.
+    residual_price_mode     = p.get('residual_price_mode', 'custom')
+    residual_price          = float(p.get('residual_price') or 0.0)
     IRR                     = p['IRR']
     duration                = int(p['duration'])
     operating_days          = int(p['operating_days'])
@@ -2971,7 +3980,8 @@ def _run_one_simulation(p, *, display=True):
             # (the dryer then passes the feed straight through).
             feed_dry_moisture = min(feed_dry_moisture, moisture)
             feedstock_type = feedstocks[selected_feedstock]['type']
-            porosity_tortuosity_ratio = porosity_torosity[feedstock_type]
+            _deff = feedstock_deff(selected_feedstock)
+            porosity_tortuosity_ratio = _deff['value']
 
             # Get solvent price. A value supplied in p (sidebar Custom, or a
             # sweep/sensitivity override) wins; otherwise look it up for the
@@ -2984,6 +3994,9 @@ def _run_one_simulation(p, *, display=True):
 
             # Define chemicals
             Solvchems = ['ethanol', 'hexane', 'acetone', 'water', 'chloroform']
+            # Gases used by BioSTEAM's stock DrumDryer (feedstock dryer D101):
+            # drying air (N2/O2) and natural-gas firing (CH4 -> CO2 + H2O).
+            DRYER_GASES = ['N2', 'O2', 'CH4', 'CO2']
 
             # ── Build combined chemical list for the proxy finder ────────────────
             # Feedstock compounds keep their rich dict format (name/cas/chebi)
@@ -2996,7 +4009,7 @@ def _run_one_simulation(p, *, display=True):
                 if name not in seen_names:
                     all_chemical_entries.append(entry)
                     seen_names.add(name)
-            for name in Solvchems + ['water']:
+            for name in Solvchems + ['water'] + DRYER_GASES:
                 if name not in seen_names:
                     all_chemical_entries.append(name)
                     seen_names.add(name)
@@ -3023,6 +4036,15 @@ def _run_one_simulation(p, *, display=True):
             def ts_to_original(ts_id):
                 """Translate a thermosteam chemical ID back to the user's original name."""
                 return name_map.get(ts_id, ts_id)
+
+            _out_labels = MACRO_LABELS.get(selected_feedstock, {})
+
+            def display_name(ts_id):
+                """Name for OUTPUT only: the original name, except fill-in
+                model compounds ('Undefined protein' / 'Undefined lipid') and
+                the balance term ('Unknown'). Never use for lookups."""
+                orig = ts_to_original(ts_id)
+                return _out_labels.get(orig, orig)
 
             def original_to_ts_func(orig_name):
                 """Translate a user's original chemical name to its thermosteam ID."""
@@ -3074,7 +4096,12 @@ def _run_one_simulation(p, *, display=True):
             # furfural, acetic acid, light phenolics) sit at alpha ~1e-2 to 1.
             ALPHA_MIN = 1e-4
 
-            solvent_names_lower = {s.lower() for s in Solvchems + ['water']}
+            # Solvents, water and the dryer gases are never phase-locked. The
+            # gases are supercritical here (Psat undefined above Tc), so the
+            # screen below would otherwise lock them to liquid and break the
+            # drum dryer's air / natural-gas / emissions streams.
+            solvent_names_lower = {s.lower() for s in
+                                   Solvchems + ['water'] + DRYER_GASES}
 
             # Screen at the hottest temperature the flowsheet reaches: the
             # evaporator's first effect sits at the solvent boiling point, or
@@ -3237,8 +4264,14 @@ def _run_one_simulation(p, *, display=True):
             )
 
             # Feedstock drying (pre-storage) streams
-            feed_dryer_vapor = bst.Stream('feed_dryer_vapor')  # water vented
-            dried_feed = bst.Stream('dried_feed')      # out of the drum dryer
+            # Stock bst.DrumDryer: hot gas = evaporated water + drying air.
+            feed_dryer_air = bst.Stream('feed_dryer_air')
+            feed_dryer_ng = bst.Stream('feed_dryer_natural_gas')
+            feed_dryer_vapor = bst.Stream('feed_dryer_vapor')  # hot gas, vented
+            feed_dryer_emissions = bst.Stream('feed_dryer_emissions')
+            # Solid phase, like the feed (the stock dryer leaves its solids
+            # outlet's phase as created).
+            dried_feed = bst.Stream('dried_feed', phase='s')
             cooled_feed = bst.Stream('cooled_feed')    # cooled → to storage
 
             solid_residual = bst.Stream('solid_residual')
@@ -3246,7 +4279,14 @@ def _run_one_simulation(p, *, display=True):
             condensate = bst.Stream('condensate')  # recovered solvent
             dryer_vapor = bst.Stream('dryer_vapor')
             dried_product = bst.Stream('dried_product')  # final product
+            # Residual dryer: solvent-wet centrifuge cake -> dried residual,
+            # sold as a co-product at residual_price ($/kg).
+            residual_dryer_vapor = bst.Stream('residual_dryer_vapor')
+            dried_residual = bst.Stream('dried_residual', price=residual_price)
             cooled_product = bst.Stream('cooled_product')  # cooled dried product
+            # Powder desolventizer streams (used only when desolv_enable)
+            desolv_vapor = bst.Stream('desolv_vapor')
+            polished_product = bst.Stream('polished_product')
 
             # ── Recycle-loop streams (used only when enable_recycle=True) ──
             # `recycle` is a tear stream — its initial flow is only a
@@ -3277,7 +4317,27 @@ def _run_one_simulation(p, *, display=True):
                                      units='kg/hr')
                 purge = bst.Stream('purge')
                 condensed_dryer_vapor = bst.Stream('condensed_dryer_vapor')
+                condensed_residual_vapor = bst.Stream(
+                    'condensed_residual_vapor')
                 mixed_recycle = bst.Stream('mixed_recycle')
+
+            # ── Solvent disposal ─────────────────────────────────────
+            # Spent-solvent waste streams are given a NEGATIVE price. In
+            # BioSTEAM every priced product counts toward sales, so a
+            # negative price is a cost: it lowers revenue, and
+            # tea.solve_price() raises the minimum selling price to cover
+            # it. Recycle on -> only the purge is waste (the rest goes back
+            # to the extractor). Recycle off -> everything recovered from
+            # the evaporator and both dryers is once-through waste.
+            if enable_recycle:
+                solvent_waste_streams = [purge]
+            else:
+                solvent_waste_streams = [condensate, dryer_vapor,
+                                         residual_dryer_vapor]
+                if desolv_enable:
+                    solvent_waste_streams.append(desolv_vapor)
+            for _ws in solvent_waste_streams:
+                _ws.price = -solv_disposal_price
 
             # Define units
             # ── Feedstock drying (upstream of storage) ────────────────
@@ -3290,19 +4350,39 @@ def _run_one_simulation(p, *, display=True):
             # cap, and end up as water in the dried product.
             #
             #   feed → D101 (drum dryer) → C101 (cooler) → S101 → U101 → U102
-            #             └→ feed_dryer_vapor (vented)
+            #             └→ feed_dryer_vapor (hot air + water, vented)
+            #
+            # D101 is BioSTEAM's stock DrumDryer (hot-air drum dryer, cost
+            # and sizing from Kwiatkowski et al. 2006). Heat is supplied by
+            # natural-gas firing when the 'natural_gas' heat utility is
+            # selected, otherwise by steam. All other dryer parameters are
+            # BioSTEAM's defaults.
             #
             # Drying is skipped entirely when disabled, in which case the
             # wet feed goes straight to storage (original topology).
             if feed_dry_enable:
-                D101 = FeedDrumDryer('Feedstock drum dryer',
-                    ins=feed,
-                    outs=[feed_dryer_vapor, dried_feed],
+                _harvest_months_list, _harvest_n = feed_harvest_season(
+                    selected_feedstock)
+                D101 = SeasonalDrumDryer('Feedstock drum dryer',
+                    ins=(feed, feed_dryer_air, feed_dryer_ng),
+                    outs=(dried_feed, feed_dryer_vapor, feed_dryer_emissions),
+                    split={'Water': 1.0},
                     moisture_ID='Water',
                     moisture_content=feed_dry_moisture,
                     T=feed_dry_T + 273.15,
-                    thermal_efficiency=feed_dryer_efficiency,
-                    U=feed_dryer_U)
+                    # Atmospheric drum dryer. BioSTEAM's DrumDryer defaults
+                    # to P = 10 atm, which cuts the exhaust water fraction
+                    # (y = RH*Psat/P) ~10x and so inflates the drying-air
+                    # flow and the heating duty. RH is BioSTEAM's default,
+                    # stated explicitly so it is reported.
+                    P=101325.,
+                    RH=0.80,
+                    # Sized to dry the year's feed within the harvest
+                    # months (12 = year-round, no scale-up).
+                    harvest_months=_harvest_n,
+                    utility_agent=('Natural gas'
+                                   if heatutility == 'natural_gas'
+                                   else 'Steam'))
                 C101 = SolidCooler('Dried feed cooler',
                     ins=dried_feed,
                     outs=[cooled_feed],
@@ -3314,8 +4394,14 @@ def _run_one_simulation(p, *, display=True):
                 C101 = None
                 _feed_to_storage = feed
 
+            # Dried feed: cone-roof tank (vertical, atmospheric, fixed roof --
+            # the closest BioSTEAM type to a silo), carbon steel (dry pomace
+            # is not corrosive), sized 100% full.
             S101 = units.StorageTank('Feedstock storage', _feed_to_storage,
-                                     tau=Fstoret)
+                                     tau=Fstoret,
+                                     vessel_type='Cone roof',
+                                     vessel_material='Carbon steel',
+                                     V_wf=1.0)
             U101 = units.ConveyingBelt('Feed transport', S101 - 0)
             U102 = Mill('Feed grinding', U101 - 0, particle_radius=Particlesize)
 
@@ -3328,8 +4414,13 @@ def _run_one_simulation(p, *, display=True):
                 #     solvent → S102 ──┐
                 #                      ├─► M1 → U103 → U105 → E201
                 #          recycle ──┘
+                # Solvent: floating-roof tank (limits vapour losses from a
+                # volatile solvent), carbon steel, 90% working volume.
                 S102 = units.StorageTank('Solvent storage', solvent,
-                                         tau=Sstoret)
+                                         tau=Sstoret,
+                                         vessel_type='Floating roof',
+                                         vessel_material='Carbon steel',
+                                         V_wf=0.9)
                 M1 = bst.Mixer('Solvent Mixer',
                                ins=(recycle, S102 - 0),
                                outs='solvent_in')
@@ -3339,8 +4430,13 @@ def _run_one_simulation(p, *, display=True):
             else:
                 # Open-loop: storage/pump/heater once-through on the
                 # fresh solvent feed (original topology).
+                # Solvent: floating-roof tank (limits vapour losses from a
+                # volatile solvent), carbon steel, 90% working volume.
                 S102 = units.StorageTank('Solvent storage', solvent,
-                                         tau=Sstoret)
+                                         tau=Sstoret,
+                                         vessel_type='Floating roof',
+                                         vessel_material='Carbon steel',
+                                         V_wf=0.9)
                 U103 = units.Pump('Solvent Pump', S102 - 0, P=ExtractP)
                 U105 = units.HXutility('Solvent Heater', U103 - 0,
                                        T=ExtractT + 273.15)
@@ -3515,21 +4611,74 @@ def _run_one_simulation(p, *, display=True):
                 get_solvent_frac_at_u(u_final)
                 _last_V[0] = _u_to_V(u_final)
 
-            SD1 = SolventSprayDryer('Spray Dryer',
-                ins=E301.outs[0],
-                outs=[dryer_vapor, dried_product],
-                solvent=solv,
-                moisture_content=dryer_moisture,
-                T=None,
-                thermal_efficiency=0.218)
+            if dryer_type == "Vacuum drum dryer":
+                # Low-temperature option: T is the 40-80 C input, pressure
+                # is calculated from it (see VacuumDrumDryer).
+                SD1 = VacuumDrumDryer('Vacuum Drum Dryer',
+                    ins=E301.outs[0],
+                    outs=[dryer_vapor, dried_product],
+                    solvent=solv,
+                    moisture_content=dryer_moisture,
+                    T=float(vdd_T_C) + 273.15,
+                    thermal_efficiency=0.95)
+            else:
+                SD1 = SolventSprayDryer('Spray Dryer',
+                    ins=E301.outs[0],
+                    outs=[dryer_vapor, dried_product],
+                    solvent=solv,
+                    moisture_content=dryer_moisture,
+                    T=None,
+                    thermal_efficiency=0.218)
 
             # ── Cooler ────────────────────────────────────────────
             # Product cooler — indirect rotary drum cooler (solid)
+            # ── Powder desolventizer (optional final ppm polishing) ──────
+            # Agitated vacuum contact dryer between the product dryer and the
+            # product cooler. See PowderDesolventizer.py for the model.
+            if desolv_enable:
+                D401 = PowderDesolventizer('Powder desolventizer',
+                    ins=dried_product,
+                    outs=[desolv_vapor, polished_product],
+                    solvent=solv,
+                    target_ppm=desolv_target_ppm,
+                    residence_time=desolv_residence_h,
+                    T=desolv_T_C + 273.15,
+                    bulk_density=desolv_bulk_density,
+                    fill_fraction=desolv_fill_fraction)
+                _to_product_cooler = polished_product
+            else:
+                D401 = None
+                _to_product_cooler = dried_product
+
             SC1 = SolidCooler('Product cooler',
-                ins=dried_product,
+                ins=_to_product_cooler,
                 outs=[cooled_product],
                 T_target=298.15,  # 25 °C (room temperature)
                 U=solid_cooler_U)
+
+            # ── Residual Dryer ────────────────────────────────────
+            # The centrifuge cake (solid_residual) leaves the extractor wet
+            # with solvent (cake_liquid_content, default 40 wt% liquid). A
+            # 40%-liquid cake is not pumpable, so it cannot go to a spray
+            # dryer; it is dried in an indirect steam-tube rotary drum dryer,
+            # the same unit (class, cost basis, efficiency and U) as the
+            # feedstock drum dryer. Differences from the feed dryer:
+            #   * it evaporates the SOLVENT (moisture_ID=solv), not water;
+            #   * outlet T = solvent Tb + 10 K (the same rule the product
+            #     dryer uses) so the solvent actually boils off;
+            #   * residual-solvent target = the "Dryer Residual Solvent"
+            #     input, shared with the product dryer.
+            # Its vapor is handled like the product dryer's: condensed and
+            # recycled when recycle is on, disposed of as solvent waste when
+            # it is off.
+            SD2 = FeedDrumDryer('Residual drum dryer',
+                ins=solid_residual,
+                outs=[residual_dryer_vapor, dried_residual],
+                moisture_ID=solv,
+                moisture_content=dryer_moisture,
+                T=tmo.settings.chemicals[solv].Tb + 10,
+                thermal_efficiency=feed_dryer_efficiency,
+                U=feed_dryer_U)
 
             # ── Solvent-recycle units ─────────────────────────────
             # H1 condenses the dryer vapor (gas) to a liquid so it can mix
@@ -3542,8 +4691,19 @@ def _run_one_simulation(p, *, display=True):
                                      ins=dryer_vapor,
                                      outs=condensed_dryer_vapor,
                                      V=0.0, rigorous=False)
+                H2 = units.HXutility('Residual dryer vapor condenser',
+                                     ins=residual_dryer_vapor,
+                                     outs=condensed_residual_vapor,
+                                     V=0.0, rigorous=False)
+                _m2_ins = [condensate, H1 - 0, H2 - 0]
+                if desolv_enable:
+                    H3 = units.HXutility('Desolventizer vapor condenser',
+                                         ins=desolv_vapor,
+                                         outs='condensed_desolv_vapor',
+                                         V=0.0, rigorous=False)
+                    _m2_ins.append(H3 - 0)
                 M2 = bst.Mixer('Recycle Mixer',
-                               ins=(condensate, H1 - 0),
+                               ins=tuple(_m2_ins),
                                outs=mixed_recycle)
                 S1 = bst.Splitter('Recycle Splitter',
                                   ins=mixed_recycle,
@@ -4021,6 +5181,48 @@ def _run_one_simulation(p, *, display=True):
                 # captured in evap_n_fb / evap_shortcut / evap_guard_counts /
                 # evap_guard_reasons above.
 
+            # ── Offset extractor cooling against the solvent heater ──
+            # With UAE/MAE, part of the electrical power heats the slurry and
+            # the extractor carries a cooling duty to hold its temperature.
+            # If the Solvent Heater is HEATING, that extractor heat is used
+            # to cover part of the heating instead: the heater duty is
+            # reduced by the extractor cooling duty (down to zero) and only
+            # any leftover stays as cooling on the extractor. If the Solvent
+            # Heater is a COOLER (or has no duty), nothing is netted and the
+            # extractor cooling is kept as cooling duty.
+            # Done after sys.simulate() and before the TEA so the utility
+            # costs the TEA reads are the netted ones. Heater capital is
+            # left as sized on its full (un-netted) duty.
+            extractor_heat_offset = 0.0   # kJ/hr moved off the heater
+            try:
+                _ext_cool = [h for h in E201.heat_utilities
+                             if h.unit_duty < 0]
+                _Q_cool = -sum(h.unit_duty for h in _ext_cool)   # > 0
+                _htr_heat = [h for h in U105.heat_utilities
+                             if h.unit_duty > 0]
+                _Q_heat = sum(h.unit_duty for h in _htr_heat)    # > 0
+                if _Q_cool > 0 and _Q_heat > 0:
+                    _offset = min(_Q_cool, _Q_heat)
+                    _T_h_in = U105.ins[0].T
+                    _T_h_out = U105.outs[0].T
+                    # Heater: one utility carrying the reduced duty.
+                    _h0 = _htr_heat[0]
+                    for _h in _htr_heat[1:]:
+                        _h.empty()
+                    _h0(_Q_heat - _offset, _T_h_in, _T_h_out)
+                    # Extractor: whatever cooling the heater couldn't absorb.
+                    _T_ext = E201.outs[1].T
+                    _c0 = _ext_cool[0]
+                    for _h in _ext_cool[1:]:
+                        _h.empty()
+                    _c0(-(_Q_cool - _offset), _T_ext, _T_ext)
+                    extractor_heat_offset = _offset
+                E201.design_results['Cooling offset by solvent heater'] = (
+                    extractor_heat_offset)
+            except Exception as _off_err:
+                print(f"Extractor/heater duty netting skipped: "
+                      f"{type(_off_err).__name__}: {_off_err}", flush=True)
+
             _advance_progress()  # Stage 5: techno-economic analysis
             #                       ESTIMATE OPERATOR HEADCOUNT
             # Operating labour is estimated with the Ulrich & Vasudevan
@@ -4044,11 +5246,12 @@ def _run_one_simulation(p, *, display=True):
             #   units.ConveyingBelt               -> conveyors (0.2)
             #   Mill                              -> crushers/mills/grinders
             #       (0.5-1 range; midpoint used)
-            #   bst.Mixer                         -> mixers (0.3)
+            #   bst.Mixer                         -> negligible (0.0)
             #   units.Pump, bst.Splitter          -> negligible dedicated
             #       attention, like pumps/drums in the table (0.0)
-            #   SolidSolventExtractor             -> reactors, as the
-            #       nearest analog to a multi-stage contacting vessel (0.5)
+            #   SolidSolventExtractor             -> 5 CSTR mixers in series
+            #       plus a centrifuge, built up as one unit (1.55)
+            #   Storage tanks                     -> 0 (skipped in the loop)
             #   CorrectedMEE                      -> evaporators (0.3)
             _ULRICH_DEFAULT = 0.2  # median of Ulrich Table 6-2 (also its
             #                        most common value); used for any unit
@@ -4056,16 +5259,19 @@ def _run_one_simulation(p, *, display=True):
             #                        that fall back to this are reported in a
             #                        warning so they can be assigned properly.
             ULRICH_OPERATORS_PER_UNIT = [
-                (FeedDrumDryer,         0.2),
+                (FeedDrumDryer,         0.2),   # residual dryer (SD2)
+                (bst.DrumDryer,         0.2),   # stock feedstock dryer (D101)
                 (SolventSprayDryer,     0.2),
+                (VacuumDrumDryer,       0.2),   # gas-solids contacting, as above
                 (SolidCooler,           0.1),
                 (units.ConveyingBelt,   0.2),
                 (Mill,                  0.75),
-                (bst.Mixer,             0.3),
+                (bst.Mixer,             0.0),   # negligible
                 (units.Pump,            0.0),
                 (bst.Splitter,          0.0),
-                (SolidSolventExtractor, 0.5),
+                (SolidSolventExtractor, 1.55),  # 5 mixers + centrifuge
                 (CorrectedMEE,          0.3),
+                (PowderDesolventizer,   0.2),   # gas-solids contacting
                 (units.HXutility,       0.1),
             ]
 
@@ -4166,6 +5372,64 @@ def _run_one_simulation(p, *, display=True):
                     return (maintenance_cost + insurance_cost + tax_cost +
                             self.labor_cost + fringe_cost + supplies_cost + admin_cost)
 
+
+            # Protein and lipid in the dried residual, summed over the same
+            # per-compound classes used for the feedstock accounting (amino
+            # acids/peptides/glutathione -> protein; fatty acids, glycerides,
+            # sterols, carotenoids, trilinolein ... -> lipid). "Dry basis"
+            # excludes the residual solvent and water. Retention is the share
+            # of the feed's protein/lipid that ends up in the residual.
+            _macro_classes = MACRO_CLASSES.get(selected_feedstock, {})
+            _macro_excl = (solv, 'Water', 'water')
+            residual_macros = _stream_macros(
+                dried_residual, _macro_classes, ts_to_original, _macro_excl)
+            feed_macros = _stream_macros(
+                feed, _macro_classes, ts_to_original, _macro_excl)
+
+            def _frac(num, den):
+                return num / den if den > 0 else 0.0
+
+            residual_protein_kg_hr = residual_macros['protein']
+            residual_lipid_kg_hr = residual_macros['lipid']
+            residual_protein_wt = _frac(residual_protein_kg_hr,
+                                        residual_macros['total'])
+            residual_lipid_wt = _frac(residual_lipid_kg_hr,
+                                      residual_macros['total'])
+            residual_protein_dry = _frac(residual_protein_kg_hr,
+                                         residual_macros['dry_total'])
+            residual_lipid_dry = _frac(residual_lipid_kg_hr,
+                                       residual_macros['dry_total'])
+            residual_protein_retained = _frac(residual_protein_kg_hr,
+                                              feed_macros['protein'])
+            residual_lipid_retained = _frac(residual_lipid_kg_hr,
+                                            feed_macros['lipid'])
+
+            # ── Residual selling price ───────────────────────────────────
+            # 'calculated': priced off the feed by its feed value (fat and
+            # protein), see _calc_residual_price(). 'custom': the $/kg
+            # entered in the sidebar. Set on the stream here -- after the
+            # simulation (so the residual composition is known) and before
+            # the TEA solves the product price, which credits this revenue.
+            feed_moisture_frac = _frac(feed_macros['total']
+                                       - feed_macros['dry_total'],
+                                       feed_macros['total'])
+            residual_moisture_frac = _frac(residual_macros['total']
+                                           - residual_macros['dry_total'],
+                                           residual_macros['total'])
+            feed_protein_dry = _frac(feed_macros['protein'],
+                                     feed_macros['dry_total'])
+            feed_lipid_dry = _frac(feed_macros['lipid'],
+                                   feed_macros['dry_total'])
+            residual_price_ratio = None
+            if residual_price_mode == 'calculated':
+                residual_price, residual_price_ratio = _calc_residual_price(
+                    feed_price,
+                    moisture_feed=feed_moisture_frac,
+                    moisture_res=residual_moisture_frac,
+                    fat_feed=feed_lipid_dry, protein_feed=feed_protein_dry,
+                    fat_res=residual_lipid_dry,
+                    protein_res=residual_protein_dry)
+            dried_residual.price = residual_price
 
             # Create TEA
             tea = ExtractionTEA(
@@ -4298,13 +5562,24 @@ def _run_one_simulation(p, *, display=True):
             annual_utility_cost = sum(
                 (unit.utility_cost or 0.0) * tea.operating_hours
                 for unit in sys.units if hasattr(unit, 'utility_cost'))
-            total_voc            = annual_material_cost + annual_utility_cost
+            solvent_waste_kg_hr = sum(s.F_mass for s in solvent_waste_streams)
+            annual_disposal_cost = (solvent_waste_kg_hr * solv_disposal_price
+                                    * tea.operating_hours)
+            total_voc            = (annual_material_cost + annual_utility_cost
+                                    + annual_disposal_cost)
             total_operating_cost = total_foc + total_voc
 
             residual_solvent_frac = (
                 cooled_product.imass[solv] / cooled_product.F_mass
                 if cooled_product.F_mass > 0 else 0.0)
             product_T_C = cooled_product.T - 273.15
+
+            # Dried residual co-product (credited in the TEA via its price)
+            residual_cake_solvent_frac = (
+                dried_residual.imass[solv] / dried_residual.F_mass
+                if dried_residual.F_mass > 0 else 0.0)
+            annual_residual_revenue = (dried_residual.F_mass * residual_price
+                                       * tea.operating_hours)
             product_F_kghr = cooled_product.F_mass
 
             installed_equipment_total = sum(
@@ -4323,6 +5598,9 @@ def _run_one_simulation(p, *, display=True):
                 'ExtractT_C':           ExtractT,
                 'extractt_hr':          extractt,
                 'particle_radius_cm':   Particlesize,
+                'deff_over_dab':        porosity_tortuosity_ratio,
+                'deff_basis':           _deff['basis'],
+                'deff_note':            _deff['note'],
                 'feed_dry_enable':      feed_dry_enable,
                 'feed_dry_moisture':    (feed_dry_moisture if feed_dry_enable
                                          else moisture),
@@ -4330,8 +5608,18 @@ def _run_one_simulation(p, *, display=True):
                                          else None),
                 'feed_moisture_as_received': moisture,
                 'feed_water_evaporated_kg_per_hr': (
-                    float(feed_dryer_vapor.F_mass) if feed_dry_enable else 0.0),
+                    # water only: the hot-gas outlet also carries drying air
+                    float(feed_dryer_vapor.imass['Water'])
+                    if feed_dry_enable else 0.0),
                 'feed_to_storage_kg_per_hr': float(S101.ins[0].F_mass),
+                'feed_harvest_months': (
+                    float(D101.design_results.get('Harvest months', 12))
+                    if feed_dry_enable else None),
+                'feed_dryer_season_factor': (
+                    float(D101.season_factor) if feed_dry_enable else None),
+                'feed_dryer_drum_area_m2': (
+                    float(D101.design_results.get('Peripheral drum area', 0))
+                    if feed_dry_enable else None),
                 'evap_n_effects':       evap_n_effects,
                 'evap_target_solids':   evap_target_solids,
                 # Solver diagnostics -- see the block after sys.simulate().
@@ -4343,7 +5631,34 @@ def _run_one_simulation(p, *, display=True):
                 'evap_guard_trips':     ("; ".join(
                     f"{k}x{v}" for k, v in evap_guard_counts.items())
                     if evap_guard_counts else ""),
+                'solvent_target_mode':  solvent_target_mode,
+                'solvent_target_basis': solvent_target_basis,
+                'solvent_target_ppm':   (desolv_target_ppm if desolv_enable
+                                         else dryer_moisture * 1e6),
                 'dryer_moisture':       dryer_moisture,
+                'dryer_type':           dryer_type,
+                'vdd_T_C':              (float(vdd_T_C)
+                                         if dryer_type == "Vacuum drum dryer"
+                                         else None),
+                'dryer_P_kPa':          (float(SD1.P) / 1e3
+                                         if dryer_type == "Vacuum drum dryer"
+                                         else None),
+                'desolv_enable':        desolv_enable,
+                'desolv_target_ppm':    (desolv_target_ppm if desolv_enable
+                                         else None),
+                'desolv_drying_time_h': (D401.design_results.get('Drying time')
+                                         if desolv_enable else None),
+                'desolv_total_volume_m3': (D401.design_results.get('Total volume')
+                                           if desolv_enable else None),
+                'desolv_n_vessels':     (D401.design_results.get('Number of vessels')
+                                         if desolv_enable else None),
+                'desolv_solvent_removed_kg_hr': (float(desolv_vapor.F_mass)
+                                                 if desolv_enable else None),
+                'desolv_installed_cost_USD': (float(D401.installed_cost)
+                                              if desolv_enable else None),
+                'cooled_product_solvent_ppm': (
+                    cooled_product.imass[solv] / cooled_product.F_mass * 1e6
+                    if cooled_product.F_mass > 0 else 0.0),
                 'enable_recycle':       enable_recycle,
                 'recycle_x_max':        recycle_x_max,
                 'Yearstart':            Yearstart,
@@ -4365,6 +5680,9 @@ def _run_one_simulation(p, *, display=True):
                 'total_opcost_USD_per_yr': total_operating_cost,
                 'annual_material_cost_USD': annual_material_cost,
                 'annual_utility_cost_USD':  annual_utility_cost,
+                'solv_disposal_price_USD_per_kg': solv_disposal_price,
+                'solvent_waste_kg_per_hr':  solvent_waste_kg_hr,
+                'annual_solvent_disposal_cost_USD': annual_disposal_cost,
                 'labor_cost_USD_per_yr':    labor_cost_val,
                 'operators_per_shift':      operators_per_shift,
                 'operators_per_shift_estimated': operators_per_shift_est,
@@ -4378,6 +5696,28 @@ def _run_one_simulation(p, *, display=True):
                 'cooled_product_kg_per_hr': product_F_kghr,
                 'cooled_product_residual_solvent_frac': residual_solvent_frac,
                 'cooled_product_T_C':       product_T_C,
+                'residual_price_USD_per_kg':  residual_price,
+                'residual_price_mode':        residual_price_mode,
+                'residual_price_ratio':       residual_price_ratio,
+                'feed_moisture_frac':         feed_moisture_frac,
+                'residual_moisture_frac':     residual_moisture_frac,
+                'feed_protein_dry_frac':      feed_protein_dry,
+                'feed_lipid_dry_frac':        feed_lipid_dry,
+                'dried_residual_kg_per_hr':   float(dried_residual.F_mass),
+                'dried_residual_solvent_frac': residual_cake_solvent_frac,
+                'residual_dryer_vapor_kg_hr': float(residual_dryer_vapor.F_mass),
+                'annual_residual_revenue_USD': annual_residual_revenue,
+                # Protein / lipid in the dried residual (see _stream_macros)
+                'residual_protein_kg_per_hr':  residual_protein_kg_hr,
+                'residual_lipid_kg_per_hr':    residual_lipid_kg_hr,
+                'residual_protein_wt_frac':    residual_protein_wt,
+                'residual_lipid_wt_frac':      residual_lipid_wt,
+                'residual_protein_dry_frac':   residual_protein_dry,
+                'residual_lipid_dry_frac':     residual_lipid_dry,
+                'residual_protein_retained_frac': residual_protein_retained,
+                'residual_lipid_retained_frac':   residual_lipid_retained,
+                'feed_protein_kg_per_hr':      feed_macros['protein'],
+                'feed_lipid_kg_per_hr':        feed_macros['lipid'],
             }
 
             # Recycle-specific metrics (only meaningful when recycle on)
@@ -4424,7 +5764,7 @@ def _run_one_simulation(p, *, display=True):
             for _chem_id, _mass_flow in zip(cooled_product.chemicals.IDs,
                                             cooled_product.mass):
                 if _mass_flow > 1e-6:
-                    _orig = ts_to_original(_chem_id)
+                    _orig = display_name(_chem_id)
                     _mg_g = ((_mass_flow * 1e6) / _comp_total_g
                              if _comp_total_g > 0 else 0.0)
                     scalars[f'extract_{_orig}_kg_per_hr'] = float(_mass_flow)
@@ -4484,7 +5824,8 @@ def _run_one_simulation(p, *, display=True):
                 # The feedstock drum dryer sees every compound in the raw
                 # feed, at the drying temperature — so thermolabile targets
                 # can be lost before extraction even starts.
-                if feed_dry_enable and D101.outs[0].F_mass > 1e-9:
+                if (feed_dry_enable
+                        and feed_dryer_vapor.imass['Water'] > 1e-9):
                     _exposures.append(
                         {'unit': 'Feedstock drum dryer (D101)',
                          'column': 'drying',
@@ -4495,9 +5836,18 @@ def _run_one_simulation(p, *, display=True):
                      'temp_C': _T_extract_C, 'chemicals': _records_in(feed)},
                     {'unit': 'Evaporator (E301)', 'column': _heat_col,
                      'temp_C': _T_evap_C,    'chemicals': _records_in(extract)},
-                    {'unit': 'Spray dryer (SD1)', 'column': 'drying',
+                    {'unit': ('Vacuum drum dryer (SD1)'
+                              if dryer_type == "Vacuum drum dryer"
+                              else 'Spray dryer (SD1)'), 'column': 'drying',
                      'temp_C': _T_dry_C,     'chemicals': _records_in(E301.outs[0])},
                 ]
+                if desolv_enable and D401.outs[0].F_mass > 1e-12:
+                    # Long hold (tens of hours) at the jacket temperature.
+                    _exposures.append(
+                        {'unit': 'Powder desolventizer dryer (D401)',
+                         'column': 'drying',
+                         'temp_C': float(desolv_T_C),
+                         'chemicals': _records_in(dried_product)})
                 _chebi = ChebiResolver(cache_path=os.path.join(
                     os.path.dirname(os.path.abspath(__file__)),
                     'chebi_group_cache.json'))
@@ -4567,9 +5917,10 @@ def _run_one_simulation(p, *, display=True):
                             feed_mass = feed_mass_lookup.get(chemical, 0)
                             pct_feed = (mass_flow / feed_mass * 100) if feed_mass > 0 else 0
                             note = _flag_note.get(_tt_norm(original_name))
+                            shown_name = display_name(chemical)
                             comp_data.append({
-                                'Chemical': (("❗ " + original_name)
-                                             if note else original_name),
+                                'Chemical': (("❗ " + shown_name)
+                                             if note else shown_name),
                                 'Mass Flow (kg/hr)': f"{mass_flow:.4f}",
                                 'Concentration (mg/g)': _fmt_mg_g(mg_per_g),
                                 '% of Feed': f"{pct_feed:.2f}%",
@@ -4609,7 +5960,19 @@ def _run_one_simulation(p, *, display=True):
 
                         st.write(f"**Cooled Product Flow:** {cooled_product.F_mass:.2f} kg/hr")
                         dsf = cooled_product.imass[solv] / cooled_product.F_mass if cooled_product.F_mass > 0 else 0
-                        st.write(f"**Residual Solvent:** {dsf:.1%}")
+                        st.write(f"**Residual Solvent:** {dsf:.1%} "
+                                 f"({dsf * 1e6:,.1f} ppm)")
+                        if desolv_enable:
+                            _dd = D401.design_results
+                            st.caption(
+                                f"Powder desolventizer: "
+                                f"{_dd.get('Inlet solvent', 0):,.0f} → "
+                                f"{_dd.get('Outlet solvent', 0):,.1f} ppm; "
+                                f"assumed drying time "
+                                f"{_dd.get('Drying time', 0):.1f} h, "
+                                f"{int(_dd.get('Number of vessels', 0))} "
+                                f"vessel(s) × "
+                                f"{_dd.get('Volume per vessel', 0):.2f} m³.")
                         st.write(f"**Product Temperature:** {cooled_product.T - 273.15:.1f} °C")
                     else:
                         st.info("No dried product composition data available")
@@ -4618,6 +5981,65 @@ def _run_one_simulation(p, *, display=True):
                     st.subheader("🎯 Minimum Product Selling Price")
                     st.metric("Price per kg", f"${Product_price:.4f} USD/kg",
                               help="The minimum price needed to achieve the target IRR")
+
+                    st.markdown("#### Dried Residual (co-product)")
+                    st.write(f"**Dried Residual Flow:** "
+                             f"{dried_residual.F_mass:,.2f} kg/hr")
+                    st.write(f"**Residual Solvent in Residual:** "
+                             f"{residual_cake_solvent_frac:.1%}")
+                    if residual_price_mode == 'calculated':
+                        if residual_price_ratio is None:
+                            st.write("**Residual Selling Price:** $0.0000/kg "
+                                     "(calculated — feed has no fat or "
+                                     "protein to price against)")
+                        else:
+                            st.write(f"**Residual Selling Price:** "
+                                     f"${residual_price:.4f}/kg (calculated: "
+                                     f"{residual_price_ratio:.4f} × feed "
+                                     f"price ${feed_price:.4f}/kg)")
+                            st.caption(
+                                f"Price_r/Price_F = (1 − "
+                                f"{residual_moisture_frac:.3f})/(1 − "
+                                f"{feed_moisture_frac:.3f}) × (0.42·"
+                                f"{residual_lipid_dry:.4f} + 0.023·"
+                                f"{residual_protein_dry:.4f})/(0.42·"
+                                f"{feed_lipid_dry:.4f} + 0.023·"
+                                f"{feed_protein_dry:.4f}) = "
+                                f"{residual_price_ratio:.4f}. Moisture_r is "
+                                f"residual solvent + water; fat and protein "
+                                f"are dry basis.")
+                    else:
+                        st.write(f"**Residual Selling Price:** "
+                                 f"${residual_price:.4f}/kg (custom)")
+                    st.write(f"**Residual Revenue:** "
+                             f"${annual_residual_revenue:,.0f}/yr "
+                             f"(credited against the product MSP)")
+
+                    if _macro_classes:
+                        st.markdown("##### Protein & lipid in residual")
+                        st.dataframe(pd.DataFrame([
+                            {'': 'Protein',
+                             'kg/hr': f"{residual_protein_kg_hr:,.2f}",
+                             'wt% (as is)': f"{residual_protein_wt:.1%}",
+                             'wt% (dry, solvent-free)':
+                                 f"{residual_protein_dry:.1%}",
+                             '% of feed retained':
+                                 f"{residual_protein_retained:.1%}"},
+                            {'': 'Lipid',
+                             'kg/hr': f"{residual_lipid_kg_hr:,.2f}",
+                             'wt% (as is)': f"{residual_lipid_wt:.1%}",
+                             'wt% (dry, solvent-free)':
+                                 f"{residual_lipid_dry:.1%}",
+                             '% of feed retained':
+                                 f"{residual_lipid_retained:.1%}"},
+                        ]), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "Summed over compounds classed as protein (amino "
+                            "acids, peptides, glutathione model) or lipid "
+                            "(fatty acids, glycerides, sterols, carotenoids, "
+                            "trilinolein model) — see the feedstock "
+                            "composition panel. Dry basis excludes residual "
+                            "solvent and water.")
 
                     # Add key process parameters
                     st.markdown("#### Key Process Parameters")
@@ -4658,6 +6080,7 @@ def _run_one_simulation(p, *, display=True):
                     ('Administration', admin_cost),
                     ('Raw Materials', annual_material_cost),
                     ('Utilities', annual_utility_cost),
+                    ('Solvent Disposal', annual_disposal_cost),
                 ]
 
                 # Capital recovery factor at the plant's own IRR and life --
@@ -4961,7 +6384,8 @@ def _run_one_simulation(p, *, display=True):
                 annual_utility_cost = sum((unit.utility_cost or 0.0) * tea.operating_hours
                                           for unit in sys.units if hasattr(unit, 'utility_cost'))
 
-                total_voc = annual_material_cost + annual_utility_cost
+                total_voc = (annual_material_cost + annual_utility_cost
+                             + annual_disposal_cost)
                 total_operating_cost = total_foc + total_voc
 
                 # Create operating costs DataFrame
@@ -4975,6 +6399,7 @@ def _run_one_simulation(p, *, display=True):
                     {'Item': 'Administration', 'Cost': admin_cost, 'Type': 'Fixed'},
                     {'Item': 'Raw Materials', 'Cost': annual_material_cost, 'Type': 'Variable'},
                     {'Item': 'Utilities', 'Cost': annual_utility_cost, 'Type': 'Variable'},
+                    {'Item': 'Solvent Disposal', 'Cost': annual_disposal_cost, 'Type': 'Variable'},
                 ]
 
                 df_operating = pd.DataFrame(operating_items)
@@ -5004,7 +6429,8 @@ def _run_one_simulation(p, *, display=True):
                     'Supplies': 'S',
                     'Administration': 'A',
                     'Raw Materials': 'RM',
-                    'Utilities': 'U'
+                    'Utilities': 'U',
+                    'Solvent Disposal': 'SD'
                 }
 
                 for item in operating_items:
@@ -5088,6 +6514,7 @@ def _run_one_simulation(p, *, display=True):
                     F_purge   = purge.F_mass
                     F_evap    = condensate.F_mass
                     F_dryer   = dryer_vapor.F_mass
+                    F_res_dryer = residual_dryer_vapor.F_mass
                     F_m2      = M2.outs[0].F_mass
 
                     cap_pass = imp_frac <= recycle_x_max + 1e-6
@@ -5129,7 +6556,7 @@ def _run_one_simulation(p, *, display=True):
                     if present_impurities:
                         imp_rows = [
                             {
-                                'Component': ts_to_original(c),
+                                'Component': display_name(c),
                                 'Mass flow (kg/hr)':
                                     f"{m1_out.imass[c]:.4f}",
                                 'Mass fraction':
@@ -5163,27 +6590,38 @@ def _run_one_simulation(p, *, display=True):
                          'Value':
                             f'{F_dryer:,.2f} kg/hr  '
                             f'({100 * F_dryer / F_m2 if F_m2 else 0:5.1f} %)'},
+                        {'Quantity':
+                            'Residual-dryer vapor (condensed) '
+                            'contribution to M2',
+                         'Value':
+                            f'{F_res_dryer:,.2f} kg/hr  '
+                            f'({100 * F_res_dryer / F_m2 if F_m2 else 0:5.1f} %)'},
                     ]
                     st.markdown("**Recycle / purge sizing**")
                     st.dataframe(pd.DataFrame(sizing_rows),
                                  use_container_width=True, hide_index=True)
 
                     # Overall mass balance: in = feed + makeup ;
-                    # out = feed-dryer vapor + solid_residual
+                    # out = feed-dryer vapor + dried_residual
                     #       + cooled_product + purge
-                    F_feed_vap = (feed_dryer_vapor.F_mass
+                    # (residual-dryer vapor is condensed into the recycle)
+                    # Only the water evaporated from the feed counts: the
+                    # dryer's hot gas also carries the drying air, which
+                    # passes straight through, and the natural-gas /
+                    # emissions streams are utility-side.
+                    F_feed_vap = (feed_dryer_vapor.imass['Water']
                                   if feed_dry_enable else 0.0)
                     F_in  = feed.F_mass + F_makeup
-                    F_out = (F_feed_vap + solid_residual.F_mass
+                    F_out = (F_feed_vap + dried_residual.F_mass
                              + cooled_product.F_mass + F_purge)
                     closure_err = F_in - F_out
                     st.markdown("**Overall mass balance**")
                     mb_rows = [
                         {'Stream': 'IN  : feed + fresh makeup',
                          'kg/hr': f'{F_in:,.3f}'},
-                        {'Stream': 'OUT : feed-dryer vapor',
+                        {'Stream': 'OUT : feed-dryer water evaporated',
                          'kg/hr': f'{F_feed_vap:,.3f}'},
-                        {'Stream': 'OUT : residual + dried product + purge',
+                        {'Stream': 'OUT : dried residual + dried product + purge',
                          'kg/hr': f'{F_out - F_feed_vap:,.3f}'},
                         {'Stream': 'Closure error',
                          'kg/hr': f'{closure_err:+.3e}'},
@@ -5196,14 +6634,20 @@ def _run_one_simulation(p, *, display=True):
                 # Display key streams
                 streams_to_display = [feed]
                 if feed_dry_enable:
-                    streams_to_display += [feed_dryer_vapor, cooled_feed]
+                    streams_to_display += [feed_dryer_air, feed_dryer_vapor,
+                                           feed_dryer_ng,
+                                           feed_dryer_emissions, cooled_feed]
                 streams_to_display += [solvent, solid_residual,
-                                       extract, condensate, dried_product,
-                                       cooled_product]
+                                       residual_dryer_vapor, dried_residual,
+                                       extract, E301.outs[0], condensate,
+                                       dried_product, cooled_product]
+                if desolv_enable:
+                    streams_to_display += [desolv_vapor, polished_product]
                 if enable_recycle:
                     # Insert recycle-loop streams so the user can inspect
                     # composition at every node of the loop.
                     streams_to_display += [dryer_vapor, condensed_dryer_vapor,
+                                           condensed_residual_vapor,
                                            mixed_recycle, recycle, purge,
                                            M1.outs[0]]
 
@@ -5229,11 +6673,17 @@ def _run_one_simulation(p, *, display=True):
                 for stream in streams_to_display:
                     with st.expander(f"Stream: {stream.ID}"):
                         stream_data = {
-                            'Property': ['Total Flow (kg/hr)', 'Temperature (°C)', 'Pressure (Pa)'],
+                            'Property': ['Total Flow (kg/hr)', 'Temperature (°C)', 'Pressure (Pa)',
+                                         'Phase'],
                             'Value': [
                                 f"{stream.F_mass:.2f}",
                                 f"{stream.T - 273.15:.2f}",
-                                f"{stream.P:.0f}"
+                                f"{stream.P:.0f}",
+                                # 'l' liquid, 'g' vapour, 's' solid; a
+                                # multi-phase stream lists its phases
+                                str(getattr(stream, 'phases', None)
+                                    if len(getattr(stream, 'phases', '')) > 1
+                                    else stream.phase)
                             ]
                         }
                         st.table(pd.DataFrame(stream_data))
@@ -5247,7 +6697,7 @@ def _run_one_simulation(p, *, display=True):
                                     original_name = ts_to_original(chemical)
                                     mg_per_g = (mass_flow * 1e6) / total_mass_g  # mg/g of stream
                                     comp_data.append({
-                                        'Chemical': original_name,
+                                        'Chemical': display_name(chemical),
                                         'Mass Flow (kg/hr)': f"{mass_flow:.6f}",
                                         'Concentration (mg/g)': _fmt_mg_g(mg_per_g),
                                     })
@@ -5306,8 +6756,16 @@ def _run_one_simulation(p, *, display=True):
                         n_comp = len({f.chemical for f in degradation_flags})
                         st.warning(f"⚠️ {n_comp} compound(s) were held above a "
                                    f"temperature known to cause degradation.")
+                        import re as _re
+
+                        def _relabel_text(txt):
+                            # Output labels for fill-in / balance compounds
+                            for _o, _l in _out_labels.items():
+                                txt = _re.sub(r'(?<![\w-])' + _re.escape(_o)
+                                              + r'(?![\w-])', _l, txt)
+                            return txt
                         for _sentence in narrative_lines(degradation_flags):
-                            st.markdown("- " + _sentence)
+                            st.markdown("- " + _relabel_text(_sentence))
                         _df_flags = pd.DataFrame(flags_to_rows(degradation_flags))
                         _df_flags = _df_flags[[
                             'chemical', 'unit', 'column_label', 'exposure_C',
@@ -5322,6 +6780,8 @@ def _run_one_simulation(p, *, display=True):
                             'governed_by': 'Governing category',
                             'matched_categories': 'All matched categories',
                             'match_basis': 'Match'})
+                        _df_flags['Compound'] = _df_flags['Compound'].map(
+                            lambda n: _out_labels.get(n, n))
                         _df_flags = _df_flags.sort_values(
                             'Over by (°C)', ascending=False)
                         with st.expander("Detailed flag table", expanded=False):
@@ -5339,7 +6799,9 @@ def _run_one_simulation(p, *, display=True):
                             st.caption("These handled compounds matched no named "
                                        "row and no ChEBI group, so they were not "
                                        "checked.")
-                            st.write(", ".join(degradation_unclassified))
+                            st.write(", ".join(
+                                _out_labels.get(n, n)
+                                for n in degradation_unclassified))
 
             # Solver summary — the recycle/evaporator convergence details,
             # rendered once here at the bottom instead of stacking green
@@ -5411,10 +6873,11 @@ def _run_one_simulation(p, *, display=True):
                         "appears in the locked list, lower ALPHA_MIN; if the "
                         "evaporator flash is driving the temperature out of "
                         "range, raise it.")
-                    _rows = ([{'chemical': _id, 'alpha': f"{_a:.3g}",
+                    _rows = ([{'chemical': display_name(_id),
+                               'alpha': f"{_a:.3g}",
                                'in VLE': '✅ yes'} for _id, _a in
                               sorted(_kept, key=lambda kv: -kv[1])]
-                             + [{'chemical': _id,
+                             + [{'chemical': display_name(_id),
                                  'alpha': ('n/a (Psat unevaluable)'
                                            if _a != _a else f"{_a:.3g}"),
                                  'in VLE': '— locked'} for _id, _a in
@@ -5480,7 +6943,12 @@ def _collect_base_params():
         'feed_dry_T':               feed_dry_T,
         'evap_n_effects':           evap_n_effects,
         'evap_target_solids':       evap_target_solids,
-        'dryer_moisture':           dryer_moisture,
+        'solvent_target_mode':      solvent_target_mode,
+        # Custom target in ppm (ignored in 'legal' mode, which resolves the
+        # limit per run from the solvent).
+        'solvent_target_ppm':       solvent_target_ppm,
+        'dryer_type':               dryer_type,
+        'vdd_T_C':                  vdd_T_C,
         'enable_recycle':           enable_recycle,
         'recycle_x_max':            recycle_x_max,
         'Yearstart':                Yearstart,
@@ -5493,6 +6961,9 @@ def _collect_base_params():
         'solv_price':               (float(solv_price_input)
                                      if solv_price_input is not None
                                      else None),
+        'solv_disposal_price':      solv_disposal_price,
+        'residual_price':           residual_price,
+        'residual_price_mode':      residual_price_mode,
         'operators_per_shift':      (int(operators_per_shift_input)
                                      if operators_per_shift_input is not None
                                      else None),
@@ -5567,8 +7038,14 @@ def _sweep_worker(state, base_params, combos, tea_mode_snapshot, results_path):
         overrides = {k: v for k, v in overrides.items() if k != '__meta__'}
 
         params = {**base_params, **overrides}
+        if 'solvent_target_ppm' in overrides:
+            # A swept / tested target is a fixed custom value.
+            params['solvent_target_mode'] = 'custom'
         if 'ExtractP_custom' in overrides:
             params['pressure_mode'] = 'Custom'
+        if 'residual_price' in overrides:
+            # A swept / sensitivity-tested residual price is a fixed $/kg.
+            params['residual_price_mode'] = 'custom'
 
         _forced_foak = False
         if (tea_mode_snapshot == "Nth Plant"
