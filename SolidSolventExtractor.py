@@ -3,10 +3,18 @@ Solid-Solvent Extraction Unit for BioSTEAM
 
 This module implements a continuous solid-solvent extractor unit operation
 that performs combined solid-liquid and liquid-liquid equilibrium separations,
-with extraction kinetics based on the Reddy-Doraiswamy diffusion model.
+with two-site film-theory extraction kinetics and Reddy-Doraiswamy diffusion
+coefficients.
 
 The equilibrium calculations determine maximum extractable amounts, while the
-kinetic model determines how much is actually extracted given the residence time.
+kinetic model determines how much is actually extracted given the residence time:
+
+    C(t)  = C_eq * [1 - (1 - b) * exp(-k t)]
+    k     = 15 * (D_eff/D_AB) * D_AB / R_eff^2
+    R_eff = max(R, 0.0175 cm)
+
+with b the washing coefficient for the reactor type and D_AB from the
+Reddy-Doraiswamy correlation.
 
 """
 
@@ -31,7 +39,7 @@ except ImportError:
 
 
 # =============================================================================
-#                    REDDY-DORAISWAMY KINETIC MODEL FUNCTIONS
+#              FILM-THEORY KINETICS WITH REDDY-DORAISWAMY DIFFUSIVITY
 # =============================================================================
 
 def calculate_Dab_RD(T, viscosity, Molvol_solute_Tb, Molvol_solvent_Tb, molmassS):
@@ -77,87 +85,113 @@ def calculate_Dab_RD(T, viscosity, Molvol_solute_Tb, Molvol_solvent_Tb, molmassS
     return Dab, K, VA_VB
 
 
-def calculate_k1_from_Dab(Dab, ParticleR, X, Cs):
-    """
-    Calculate the rate constant k1 from diffusion coefficient.
+# Film-theory kinetic constants (validated against carrot beta-carotene
+# (conventional), Patil & Akamanchi 2017 camptothecin (MAE) and Yuniati et al.
+# 2025 coffee caffeine (UAE))
+KINETIC_GEOMETRY_FACTOR = 15.0     # Glueckauf (1955) LDF constant for a sphere
 
-    k1 = R² / (15 * Dab * X * Cs)
+# Minimum particle radius (cm). Below about 0.35 mm diameter, extraction is
+# limited by diffusion through cell walls rather than through the particle
+# (Lomovskiy et al. 2020, Processes 8:1348), so a smaller particle does not
+# extract faster and the 1/R^2 scaling no longer applies.
+MIN_PARTICLE_RADIUS = 0.035 / 2    # cm (0.35 mm diameter)
+
+# Washing coefficient b: fraction of accessible solute released on first
+# contact with the solvent (two-site film theory).
+#   conventional 0.29 : mean conventional value for fresh fruit and veg
+#                       (Teixeira et al. 2023, 2024)
+#   ultrasound   0.30 : UAE value used in the validation
+#   microwave    0.5595 : Chan et al. (2015)
+WASHING_COEFFICIENTS = {
+    'conventional': 0.29,
+    'ultrasound': 0.30,
+    'microwave': 0.5595,
+}
+
+
+def calculate_k_film_theory(Dab, ParticleR, X, geometry_factor=KINETIC_GEOMETRY_FACTOR):
+    """
+    Film-theory rate constant from the diffusion coefficient.
+
+    k = geometry_factor * X * Dab / R_eff^2,   R_eff = max(R, MIN_PARTICLE_RADIUS)
 
     Parameters
     ----------
     Dab : float
         Diffusion coefficient (cm²/s)
     ParticleR : float
-        Particle radius (cm)
+        Particle radius (cm). Radii below MIN_PARTICLE_RADIUS are raised to it.
     X : float
-        Porosity/tortuosity ratio (dimensionless)
-    Cs : float
-        Initial/reference concentration
+        D_eff/D_AB (porosity/tortuosity ratio, dimensionless)
+    geometry_factor : float, optional
+        15 (Glueckauf LDF, default) or pi^2 (first term of Crank's sphere solution)
 
     Returns
     -------
-    k1 : float
-        Rate constant for extraction kinetics
+    k : float
+        Rate constant (1/s)
+    R_eff : float
+        Radius used (cm)
     """
-    if Cs <= 0 or Dab <= 0:
-        return float('inf')
-    k1 = (ParticleR**2) / (15 * Dab * X * Cs)
-    return k1
+    R_eff = max(ParticleR, MIN_PARTICLE_RADIUS)
+    if Dab <= 0 or X <= 0:
+        return 0.0, R_eff
+    return geometry_factor * X * Dab / R_eff**2, R_eff
 
 
-def extraction_kinetics(t, k1, EQcomp):
+def extraction_kinetics(t, k, b, EQcomp):
     """
-    Extraction kinetics model based on diffusion.
-    Returns concentration as a function of time.
+    Two-site film-theory kinetics (So & Macdonald 1986; Velickovic et al. 2006).
 
-    C(t) = t / (k1 + t/EQcomp)
+    C(t) = C_eq * [1 - (1 - b) * exp(-k t)]   for t > 0, and 0 at t = 0
 
-    As t -> infinity, C -> EQcomp
+    A fraction b is washed out on contact with the solvent; the rest diffuses
+    out with first-order rate constant k. As t -> infinity, C -> C_eq.
 
     Parameters
     ----------
     t : float or array
         Time in seconds
-    k1 : float
-        Rate constant
+    k : float
+        Rate constant (1/s)
+    b : float
+        Washing coefficient (0-1)
     EQcomp : float
-        Equilibrium concentration (maximum extractable)
+        Equilibrium (maximum extractable) amount
 
     Returns
     -------
     C : float or array
-        Concentration at time t
+        Amount extracted at time t
     """
-    if k1 == float('inf') or EQcomp <= 0:
-        return 0.0
+    if EQcomp <= 0:
+        return 0.0 * t
     if isinstance(t, np.ndarray):
-        return np.where(t > 0, t / (k1 + t / EQcomp), 0)
-    else:
-        return t / (k1 + t / EQcomp) if t > 0 else 0.0
+        return np.where(t > 0, EQcomp * (1.0 - (1.0 - b) * np.exp(-k * t)), 0.0)
+    return EQcomp * (1.0 - (1.0 - b) * np.exp(-k * t)) if t > 0 else 0.0
 
 
-def calculate_extraction_fraction(t, k1, EQcomp):
+def calculate_extraction_fraction(t, k, b):
     """
-    Calculate the fraction of equilibrium achieved at time t.
+    Fraction of equilibrium reached at time t: 1 - (1 - b) * exp(-k t).
 
     Parameters
     ----------
     t : float
         Time in seconds
-    k1 : float
-        Rate constant
-    EQcomp : float
-        Equilibrium concentration
+    k : float
+        Rate constant (1/s)
+    b : float
+        Washing coefficient (0-1)
 
     Returns
     -------
     fraction : float
         Fraction of equilibrium achieved (0 to 1)
     """
-    if EQcomp <= 0:
-        return 1.0
-    C_t = extraction_kinetics(t, k1, EQcomp)
-    return min(C_t / EQcomp, 1.0)
+    if t <= 0:
+        return 0.0
+    return min(1.0 - (1.0 - b) * np.exp(-k * t), 1.0)
 
 
 # =============================================================================
@@ -729,8 +763,9 @@ class SolidSolventExtractor(Unit):
 
     A combined unit operation that performs solid-liquid equilibrium (SLE)
     and liquid-liquid equilibrium (LLE) separation in a stirred tank, followed
-    by centrifugal separation of solids. Uses Reddy-Doraiswamy extraction
-    kinetics to account for mass transfer limitations.
+    by centrifugal separation of solids. Uses two-site film-theory extraction
+    kinetics with Reddy-Doraiswamy diffusion coefficients to account for mass
+    transfer limitations.
 
     For compounds without UNIFAC groups in thermosteam, the unit automatically
     falls back to Hansen Solubility Parameter (HSP) based predictions using
@@ -764,11 +799,18 @@ class SolidSolventExtractor(Unit):
 
     where K = 8.5e-8 if VA/VB < 1.5, else K = 1.0e-7
 
-    The extraction follows:
+    The extraction follows two-site film theory (So & Macdonald 1986;
+    Velickovic et al. 2006):
 
-        C(t) = t / (k1 + t/C_eq)
+        C(t) = C_eq × [1 − (1 − b) × exp(−k t)]
 
-    where k1 = R² / (15 × Dab × X × Cs)
+        k = 15 × X × Dab / R_eff²,   R_eff = max(R, 0.0175 cm)
+
+    where X = D_eff/D_AB, b is the washing coefficient for the reactor type
+    (conventional 0.29, ultrasound 0.30, microwave 0.5595) and C(t) is
+    evaluated at t = tau. Below 0.35 mm diameter, cell-wall diffusion limits
+    extraction (Lomovskiy et al. 2020), so particle_radius may not be set
+    below 0.0175 cm.
 
     Parameters
     ----------
@@ -805,9 +847,14 @@ class SolidSolventExtractor(Unit):
         account for how effectively the solvent can reach solute within the
         solid matrix.
     particle_radius : float, optional
-        Particle radius in cm. Default is 0.254 cm.
+        Particle radius in cm. Default is 0.254 cm. Must be at least
+        MIN_PARTICLE_RADIUS (0.0175 cm, i.e. 0.35 mm diameter); a smaller
+        value raises ValueError.
     porosity_tortuosity_ratio : float, optional
-        Ratio of porosity to tortuosity (ε/τ). Default is 0.13.
+        D_eff/D_AB, the ratio of porosity to tortuosity (ε/τ). Default is 0.13.
+    washing_coefficient : float, optional
+        Washing coefficient b (0-1). If None (default), the value for the
+        reactor type in WASHING_COEFFICIENTS is used.
     sle_max_iter : int, optional
         Maximum iterations for SLE calculation. Default is 20.
     sle_tol : float, optional
@@ -851,9 +898,17 @@ class SolidSolventExtractor(Unit):
     -----
     **Kinetics Model Basis:**
 
-    The Reddy-Doraiswamy correlation was validated against experimental
-    beta-carotene extraction data from carrots at 30-50°C using ethanol
-    as solvent. The model achieved R² > 0.99 across all temperatures.
+    The film-theory model with Reddy-Doraiswamy D_AB and k = 15·D_eff/R² was
+    validated against:
+
+    - Conventional: beta-carotene from carrot in ethanol, 30-50 °C,
+      d = 5.08 mm, D_eff/D = 0.13, b = 0.29 (R² 0.83-0.92)
+    - MAE: camptothecin from N. nimmoniana stem in methanol, 50 °C, 120 W,
+      d = 0.63 mm, D_eff/D = 0.225, b = 0.5595 (R² 0.99; Patil & Akamanchi
+      2017, Ind. Crops Prod. 98:60, doi:10.1016/j.indcrop.2017.01.023)
+    - UAE: caffeine from Arabica coffee in water, 40-70 °C, d = 1.25 mm,
+      D_eff/D = 0.069, b = 0.30 (R² 0.94-0.96; Yuniati et al. 2025,
+      Ultrason. Sonochem. 122:107627, doi:10.1016/j.ultsonch.2025.107627)
 
     **HSP Fallback:**
 
@@ -879,13 +934,11 @@ class SolidSolventExtractor(Unit):
         - Base cost: $68,800 at 3.6 kW (CEPCI 798.88, 2025)
         - Scaling exponent: 1.0
         - Power: 66.66 W per L of vessel volume
-        - Bare module: 2.5
 
     - **Microwave Extractor (MAE):**
         - Base cost: $180,000 at 100 kW (CEPCI 596.2, 2020)
         - Scaling exponent: 0.6
         - Power: 83.33 W per L of vessel volume
-        - Bare module: 2.5
 
     - **Centrifuge:** Based on Seider et al. (2017)
         - Base cost: $68,040 at 1 ton/hr solids
@@ -942,8 +995,7 @@ class SolidSolventExtractor(Unit):
               'Centrifuge power': 'kW',
               'Total power': 'kW',
               'Heat to slurry': 'kW',
-              'Cooling duty': 'kJ/hr',
-              'Cooling offset by solvent heater': 'kJ/hr'}
+              'Cooling duty': 'kJ/hr'}
 
     _has_power_utility = True
 
@@ -970,6 +1022,7 @@ class SolidSolventExtractor(Unit):
                  reactor_type='conventional',
                  particle_radius=0.254,
                  porosity_tortuosity_ratio=0.13,
+                 washing_coefficient=None,
                  sle_max_iter=20,
                  sle_tol=0.001,
                  lle_attempts=3,
@@ -987,6 +1040,7 @@ class SolidSolventExtractor(Unit):
         self.reactor_type = reactor_type
         self.particle_radius = particle_radius
         self.porosity_tortuosity_ratio = porosity_tortuosity_ratio
+        self.washing_coefficient = washing_coefficient
         self.sle_max_iter = sle_max_iter
         self.sle_tol = sle_tol
         self.lle_attempts = lle_attempts
@@ -1028,6 +1082,36 @@ class SolidSolventExtractor(Unit):
                 f"Valid options are: {valid_types}"
             )
         self._reactor_type = value_lower
+
+    @property
+    def particle_radius(self):
+        """Particle radius (cm). Must be at least MIN_PARTICLE_RADIUS (0.0175 cm)."""
+        return self._particle_radius
+
+    @particle_radius.setter
+    def particle_radius(self, value):
+        value = float(value)
+        if value < MIN_PARTICLE_RADIUS:
+            raise ValueError(
+                f"particle_radius = {value} cm is below the minimum of "
+                f"{MIN_PARTICLE_RADIUS} cm (0.35 mm diameter). Below this size, "
+                f"extraction is limited by diffusion through cell walls "
+                f"(Lomovskiy et al. 2020) and the kinetic model does not apply."
+            )
+        self._particle_radius = value
+
+    @property
+    def washing_coefficient(self):
+        """Washing coefficient b; defaults to the value for the reactor type."""
+        if self._washing_coefficient is None:
+            return WASHING_COEFFICIENTS[self._reactor_type]
+        return self._washing_coefficient
+
+    @washing_coefficient.setter
+    def washing_coefficient(self, value):
+        if value is not None and not 0.0 <= value < 1.0:
+            raise ValueError(f"washing_coefficient must be in [0, 1); got {value}")
+        self._washing_coefficient = value
 
     @property
     def accessibility_factor(self):
@@ -1102,13 +1186,17 @@ class SolidSolventExtractor(Unit):
     def _apply_kinetics(self, compound_name, equilibrium_amount, total_feed_amount,
                         T, solvent_props):
         """
-        Apply Reddy-Doraiswamy kinetics to determine actual extraction amount.
+        Apply film-theory kinetics (Reddy-Doraiswamy D_AB) to determine the
+        actual extraction amount at t = tau.
 
         The equilibrium amount is adjusted by the accessibility factor based on
         reactor type before being used in the kinetic model:
         - Conventional: 0.67 (limited by diffusion through pores)
         - Ultrasound assisted: 0.86 (cavitation improves mass transfer)
         - Microwave assisted: 1.0 (volumetric heating maximizes accessibility)
+
+        Extraction fraction = 1 - (1 - b) * exp(-k * tau), with
+        k = 15 * X * Dab / R_eff^2 and R_eff = max(R, MIN_PARTICLE_RADIUS).
         """
         solute_chem = self.chemicals[compound_name]
         Molvol_solute_Tb = self._get_solute_molvol_Tb(solute_chem)
@@ -1121,14 +1209,12 @@ class SolidSolventExtractor(Unit):
             molmassS=solvent_props['MW']
         )
 
-        Cs = total_feed_amount if total_feed_amount > 0 else 1.0
-
-        k1 = calculate_k1_from_Dab(
+        k, R_eff = calculate_k_film_theory(
             Dab=Dab,
             ParticleR=self.particle_radius,
-            X=self.porosity_tortuosity_ratio,
-            Cs=Cs
+            X=self.porosity_tortuosity_ratio
         )
+        b = self.washing_coefficient
 
         t_seconds = self.tau * 3600
 
@@ -1138,11 +1224,7 @@ class SolidSolventExtractor(Unit):
         accessible_equilibrium = equilibrium_amount * self.accessibility_factor
 
         if accessible_equilibrium > 0:
-            extraction_frac = calculate_extraction_fraction(
-                t=t_seconds,
-                k1=k1,
-                EQcomp=accessible_equilibrium
-            )
+            extraction_frac = calculate_extraction_fraction(t=t_seconds, k=k, b=b)
         else:
             extraction_frac = 1.0
 
@@ -1152,7 +1234,10 @@ class SolidSolventExtractor(Unit):
             'Dab': Dab,
             'K_used': K_used,
             'VA_VB': VA_VB,
-            'k1': k1,
+            'k': k,
+            'washing_coefficient': b,
+            'R_eff': R_eff,
+            'Deff_over_Dab': self.porosity_tortuosity_ratio,
             'Molvol_solute_Tb': Molvol_solute_Tb,
             't_seconds': t_seconds,
             'equilibrium_amount': equilibrium_amount,
@@ -1168,7 +1253,7 @@ class SolidSolventExtractor(Unit):
     def _run(self):
         """
         Run mass and energy balance using solid-solvent extraction equilibrium
-        with Reddy-Doraiswamy kinetics correction.
+        with film-theory kinetics correction (Reddy-Doraiswamy D_AB).
         """
         feed, solvent_stream = self.ins
         solid_out, extract_out = self.outs
@@ -1430,12 +1515,13 @@ class SolidSolventExtractor(Unit):
         # ======================================================================
         if self.verbose:
             print("\n" + "=" * 80)
-            print("STEP 3: APPLYING REDDY-DORAISWAMY KINETICS")
+            print("STEP 3: APPLYING FILM-THEORY KINETICS (REDDY-DORAISWAMY D_AB)")
             print("=" * 80)
             print(f"Reactor type: {self.reactor_type}")
             print(f"Accessibility factor: {self.accessibility_factor}")
             print(f"Particle radius: {self.particle_radius} cm")
-            print(f"Porosity/tortuosity ratio: {self.porosity_tortuosity_ratio}")
+            print(f"D_eff/D_AB (porosity/tortuosity ratio): {self.porosity_tortuosity_ratio}")
+            print(f"Washing coefficient b: {self.washing_coefficient}")
             print(f"Residence time: {self.tau} hours ({self.tau * 3600:.0f} seconds)")
             print(f"Solvent viscosity at {T:.1f}K: {solvent_props['viscosity']:.4f} cP")
             print("-" * 80)
@@ -1477,7 +1563,7 @@ class SolidSolventExtractor(Unit):
                 acc_eq = kinetics_data['accessible_equilibrium']
                 print(f"{compound}:")
                 print(f"  Dab = {kinetics_data['Dab']:.4e} cm²/s")
-                print(f"  k1 = {kinetics_data['k1']:.2f}")
+                print(f"  k = {kinetics_data['k']*60:.4g} 1/min (R_eff = {kinetics_data['R_eff']:.4f} cm, b = {kinetics_data['washing_coefficient']})")
                 print(f"  Equilibrium: {eq_amount:.4f} mol")
                 print(f"  Accessible equilibrium: {acc_eq:.4f} mol ({self.accessibility_factor*100:.0f}%)")
                 print(f"  Extracted: {actual_amount:.4f} mol ({frac*100:.1f}% of accessible equilibrium)")
