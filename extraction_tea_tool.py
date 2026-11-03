@@ -2617,10 +2617,11 @@ ExtractT = st.sidebar.number_input(
 extractt = st.sidebar.number_input(
     "Extraction Time (hr)",
     min_value=0.1, max_value=24.0, value=2.0, step=0.1,
-    help="Total residence time of feedstock in the extractor. The extractor "
-         "is modelled as 5 CSTRs in series (each 1/5 of this time) followed "
-         "by a centrifuge; 6% of the feed bypasses extraction and leaves "
-         "untouched in the residual."
+    help="Total residence time of feedstock in the extractor. The "
+         "conventional extractor is modelled as 5 CSTRs in series (each 1/5 "
+         "of this time); ultrasound and microwave use a single extractor. "
+         "Either is followed by a centrifuge; 6% of the feed bypasses "
+         "extraction and leaves untouched in the residual."
 )
 
 Particlesize = st.sidebar.number_input(
@@ -5249,8 +5250,9 @@ def _run_one_simulation(p, *, display=True):
             #   bst.Mixer                         -> negligible (0.0)
             #   units.Pump, bst.Splitter          -> negligible dedicated
             #       attention, like pumps/drums in the table (0.0)
-            #   SolidSolventExtractor             -> 5 CSTR mixers in series
-            #       plus a centrifuge, built up as one unit (1.55)
+            #   SolidSolventExtractor             -> extractor (5 CSTR
+            #       mixers in series for conventional, one vessel for
+            #       UAE/MAE) plus a centrifuge, built up as one unit (1.55)
             #   Storage tanks                     -> 0 (skipped in the loop)
             #   CorrectedMEE                      -> evaporators (0.3)
             _ULRICH_DEFAULT = 0.2  # median of Ulrich Table 6-2 (also its
@@ -7014,7 +7016,23 @@ except Exception:
 # BioSTEAM uses a global flowsheet / settings, so two simulations must never
 # run at the same time (background sweep worker + a Single Run, or two browser
 # sessions sharing one Community Cloud process). This lock serialises them.
-_SIM_LOCK = threading.Lock()
+#
+# Streamlit re-executes this whole script on EVERY rerun, so a plain
+# module-level `threading.Lock()` was a NEW lock each rerun: a sweep thread
+# started on one rerun and a thread started on a later rerun (e.g. after a
+# websocket reconnect behind a proxy such as Railway's) held different locks
+# and ran concurrently on the global BioSTEAM state, corrupting each other's
+# runs (zero product flow, 'NoneType' has no attribute 'isfuel'). The lock and
+# the registry of live sweep threads are therefore kept in st.cache_resource,
+# which is created once per server process and shared by every rerun and
+# session.
+@st.cache_resource
+def _sim_globals():
+    return {'lock': threading.Lock(), 'sweeps': {}}
+
+
+_G = _sim_globals()
+_SIM_LOCK = _G['lock']
 
 
 def _sweep_results_path(sweep_key):
@@ -7110,6 +7128,13 @@ def _stop_any_active_run(keep_key=None):
         s = st.session_state.get(k)
         if s and s.get('running') and s.get('stop') is not None:
             s['stop'].set()
+    # Also stop live sweeps started by another session (e.g. the session that
+    # existed before a reconnect), which this session_state cannot see.
+    for k, s in list(_G['sweeps'].items()):
+        if keep_key is not None and f"sweepstate_{k}" == keep_key:
+            continue
+        if s.get('thread') is not None and s['thread'].is_alive():
+            s['stop'].set()
 
 
 def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
@@ -7121,7 +7146,6 @@ def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
     only affects how the results are rendered, not how they are executed.
     Returns the session_state key under which the run state is stored.
     """
-    _stop_any_active_run()
     # The sweep key doubles as the on-disk resume filename, so the 'sweep'
     # form is kept byte-identical to what earlier versions wrote -- a sweep
     # stopped before this mode was added still resumes. Only the new
@@ -7132,6 +7156,25 @@ def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
         _key_src.encode("utf-8")).hexdigest()[:16]
     results_path = _sweep_results_path(sweep_key)
     state_key = f"sweepstate_{sweep_key}"
+
+    # A sweep for this exact configuration may already be running in this
+    # process -- typically because the browser reconnected (new session) or
+    # the button press was replayed. Re-attach to it instead of launching a
+    # second thread on the same points.
+    live = _G['sweeps'].get(sweep_key)
+    if live is not None and live.get('thread') is not None \
+            and live['thread'].is_alive():
+        if not fresh:
+            _stop_any_active_run(keep_key=state_key)
+            st.session_state[state_key] = live
+            st.session_state[active_slot] = state_key
+            return state_key
+        # Fresh restart requested: stop the old thread and wait for its
+        # current run to finish so the two never overlap.
+        live['stop'].set()
+        live['thread'].join()
+
+    _stop_any_active_run(keep_key=state_key)
 
     # If a sweep for this key is already running, stop it before relaunching.
     old = st.session_state.get(state_key)
@@ -7195,6 +7238,7 @@ def _start_sweep(sweep_values, base_params, combos, tea_mode_snapshot,
     )
     t.start()
     state['thread'] = t
+    _G['sweeps'][sweep_key] = state     # visible to every session/rerun
     st.session_state[state_key] = state
     st.session_state[active_slot] = state_key
     return state_key
@@ -7448,6 +7492,23 @@ def _render_sweep(state):
 
     return running
 
+
+def _attach_live_run(mode, active_slot):
+    """After a reconnect the new session has no record of a sweep / sensitivity
+    run that is still running in the background. Re-attach it so its progress
+    is shown instead of "No active sweep" (and so it is not relaunched)."""
+    if st.session_state.get(active_slot):
+        return
+    for k, s in _G['sweeps'].items():
+        if (s.get('mode') == mode and s.get('thread') is not None
+                and s['thread'].is_alive()):
+            st.session_state[f"sweepstate_{k}"] = s
+            st.session_state[active_slot] = f"sweepstate_{k}"
+            return
+
+
+_attach_live_run('sweep', 'sweep_active')
+_attach_live_run('sensitivity', 'sens_active')
 
 if sim_mode == "Single Run" and run_simulation:
     with _SIM_LOCK:
