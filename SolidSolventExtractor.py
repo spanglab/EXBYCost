@@ -773,9 +773,12 @@ class SolidSolventExtractor(Unit):
 
     The unit is designed and costed as a combination of:
 
-    1. **N_stages CSTRs in series** (default 5) - for extraction contact,
-       each sized for 1/N_stages of the total residence time
-    2. **Solids Centrifuge** - one unit at the end of the train for final
+    1. **Extraction vessel(s)** - for extraction contact:
+       - conventional: N_stages CSTRs in series (default 5), each sized for
+         1/N_stages of the total residence time
+       - ultrasound / microwave: a single extractor sized for the total
+         residence time (N_stages is not used)
+    2. **Solids Centrifuge** - one unit after the extractor for final
        solid-liquid separation
 
     **Unextracted bypass:** a fixed ``bypass_fraction`` (default 6%) of the
@@ -821,14 +824,16 @@ class SolidSolventExtractor(Unit):
         [0] Solid/residual stream
         [1] Extract stream (solvent-rich with dissolved compounds)
     tau : float, optional
-        TOTAL residence time across the CSTR train (hours). Each of the
-        ``N_stages`` CSTRs is sized for tau / N_stages. Default is 2 hours.
+        TOTAL residence time in the extractor (hours). For conventional,
+        each of the ``N_stages`` CSTRs is sized for tau / N_stages; UAE/MAE
+        use a single vessel sized for tau. Default is 2 hours.
     V : float, optional
-        TOTAL vessel volume of the CSTR train in m³ (split equally over
-        the stages). If specified, overrides tau.
+        TOTAL extractor vessel volume in m³ (for conventional, split equally
+        over the stages). If specified, overrides tau.
     N_stages : int, optional
-        Number of equal-volume CSTRs in series ahead of the centrifuge.
-        Default is 5.
+        Number of equal-volume CSTRs in series ahead of the centrifuge for
+        the conventional extractor. Default is 5. Ignored for 'ultrasound'
+        and 'microwave', which are always a single vessel.
     bypass_fraction : float, optional
         Fraction of the solid feed (ins[0]) that passes through the unit
         without being extracted and leaves unchanged in the residual
@@ -922,8 +927,9 @@ class SolidSolventExtractor(Unit):
 
     **Cost Basis:**
 
-    All extractor correlations below are applied PER CSTR (sized on that
-    stage's volume or power) and multiplied by N_stages.
+    Conventional: the mixing-tank correlation is applied PER CSTR (sized on
+    that stage's volume) and multiplied by N_stages. UAE/MAE: the correlation
+    is applied to the single extractor vessel.
 
     - **Mixing Tank (conventional):** Based on Apostolakou et al. (2009)
         - Base cost: $12,080 at 10 m³ (per CSTR)
@@ -933,7 +939,7 @@ class SolidSolventExtractor(Unit):
     - **Ultrasound Extractor (UAE):**
         - Base cost: $68,800 at 3.6 kW (CEPCI 798.88, 2025)
         - Scaling exponent: 1.0
-        - Power: 66.66 W per L of vessel volume
+        - Power: 18 W per L of vessel volume
 
     - **Microwave Extractor (MAE):**
         - Base cost: $180,000 at 100 kW (CEPCI 596.2, 2020)
@@ -948,8 +954,8 @@ class SolidSolventExtractor(Unit):
     **Power Requirements:**
 
     - Conventional tank agitation: 0.5 kW per m³ of each CSTR's volume
-    - UAE: 66.66 W per L of each CSTR's volume (V = Q x tau)
-    - MAE: 83.33 W per L of each CSTR's volume (V = Q x tau)
+    - UAE: 18 W per L of extractor volume (V = Q x tau)
+    - MAE: 83.33 W per L of extractor volume (V = Q x tau)
     - UAE/MAE cooling duty: heat_efficiency (default 70%) of the extractor
       power is heat added to the slurry, removed by a cooling utility at
       the operating temperature to keep T constant
@@ -984,10 +990,10 @@ class SolidSolventExtractor(Unit):
     _N_outs = 2
     _units = {'Volume': 'm^3',
               'Residence time': 'hr',
-              'Number of CSTRs': '',
-              'Volume per CSTR': 'm^3',
-              'Residence time per CSTR': 'hr',
-              'Extractor power per CSTR': 'kW',
+              'Number of vessels': '',
+              'Volume per vessel': 'm^3',
+              'Residence time per vessel': 'hr',
+              'Extractor power per vessel': 'kW',
               'Bypass fraction': '',
               'Solids loading': 'ton/hr',
               'Extractor power': 'kW',
@@ -1003,8 +1009,8 @@ class SolidSolventExtractor(Unit):
     # These factors account for how effectively the solvent can access
     # the solute within the solid matrix
     # Volumetric power densities for assisted extraction (W per L of vessel
-    # volume). Applied to each CSTR's volume, so total power = density x V.
-    UAE_POWER_DENSITY = 66.66   # W/L
+    # volume). UAE/MAE use one vessel, so total power = density x V.
+    UAE_POWER_DENSITY = 18.0    # W/L
     MAE_POWER_DENSITY = 83.33   # W/L
 
     ACCESSIBILITY_FACTORS = {
@@ -1057,6 +1063,18 @@ class SolidSolventExtractor(Unit):
         self.cake_liquid = 0.0
         self.cake_liquid_fraction = 0.0
         self.entrained_extract = 0.0
+
+    @property
+    def n_vessels(self):
+        """Number of extraction vessels: N_stages CSTRs in series for the
+        conventional extractor, a single vessel for ultrasound / microwave."""
+        if self._reactor_type == 'conventional':
+            N = int(self.N_stages)
+            if N < 1:
+                raise ValueError(
+                    f"N_stages must be >= 1; got {self.N_stages}")
+            return N
+        return 1
 
     @property
     def reactor_type(self):
@@ -1689,14 +1707,14 @@ class SolidSolventExtractor(Unit):
                   f"({self.cake_liquid_fraction:.1%})")
             print(f"Extract entrained: {self.entrained_extract:.3f} kg/hr")
 
-    # Cost correlation parameters for each reactor type.
-    # These are applied PER CSTR (to that stage's volume or power) and the
-    # result is multiplied by N_stages.
-    # For conventional: mixing tank scaled on Volume per CSTR (m³)
-    # For UAE/MAE: extractor equipment scaled on power per CSTR (kW)
+    # Cost correlation parameters for each reactor type, applied PER VESSEL
+    # and multiplied by the number of vessels (n_vessels).
+    # For conventional: mixing tank scaled on volume per CSTR (m³), N_stages
+    # CSTRs
+    # For UAE/MAE: extractor equipment scaled on its power (kW), one vessel
     EXTRACTOR_COST_PARAMS = {
         'conventional': {
-            'basis': 'Volume per CSTR',
+            'basis': 'Volume per vessel',
             'units': 'm^3',
             'cost': 12080,
             'CE': 525.4,
@@ -1705,7 +1723,7 @@ class SolidSolventExtractor(Unit):
             'S': 10,
         },
         'ultrasound': {
-            'basis': 'Extractor power per CSTR',
+            'basis': 'Extractor power per vessel',
             'units': 'kW',
             'cost': 68800,
             'CE': 798.88,
@@ -1714,7 +1732,7 @@ class SolidSolventExtractor(Unit):
             'S': 3.6,
         },
         'microwave': {
-            'basis': 'Extractor power per CSTR',
+            'basis': 'Extractor power per vessel',
             'units': 'kW',
             'cost': 180000,
             'CE': 596.2,
@@ -1725,17 +1743,18 @@ class SolidSolventExtractor(Unit):
     }
 
     def _design(self):
-        """Design the CSTR train (N_stages equal CSTRs) and the centrifuge."""
+        """Design the extractor vessel(s) and the centrifuge.
+
+        Conventional: N_stages equal CSTRs in series. UAE/MAE: one vessel.
+        """
         Design = self.design_results
 
         feed, solvent = self.ins
         solid_out, extract_out = self.outs
 
-        N = int(self.N_stages)
-        if N < 1:
-            raise ValueError(f"N_stages must be >= 1; got {self.N_stages}")
+        N = self.n_vessels
 
-        # Every CSTR in series carries the full flow. The bypassed fraction
+        # Every vessel in series carries the full flow. The bypassed fraction
         # still physically passes through the vessels (it just isn't
         # extracted), so the equipment is sized on the full throughput.
         Q_feed = feed.F_vol
@@ -1749,14 +1768,14 @@ class SolidSolventExtractor(Unit):
             self.tau = V / Q_total if Q_total > 0 else 0
 
         V = max(V, 0.1)
-        V_stage = V / N                     # each CSTR: tau / N residence time
+        V_stage = V / N                     # each vessel: tau / N residence time
         tau_stage = self.tau / N
 
-        Design['Number of CSTRs'] = N
+        Design['Number of vessels'] = N
         Design['Volume'] = V
-        Design['Volume per CSTR'] = V_stage
+        Design['Volume per vessel'] = V_stage
         Design['Residence time'] = self.tau
-        Design['Residence time per CSTR'] = tau_stage
+        Design['Residence time per vessel'] = tau_stage
         Design['Bypass fraction'] = self.bypass_fraction
 
         # Centrifuge is sized on DRY solids (as in BioSTEAM's SolidsCentrifuge),
@@ -1767,26 +1786,26 @@ class SolidSolventExtractor(Unit):
 
         Design['Solids loading'] = solids_loading
 
-        # Single centrifuge at the end of the train (unchanged)
+        # Single centrifuge after the extractor (unchanged)
         centrifuge_power = Q_total * 1.40
 
-        # Extractor power is evaluated per CSTR, then multiplied by N
+        # Extractor power is evaluated per vessel, then multiplied by N
         V_stage_L = V_stage * 1000  # m³ -> L
         if self._reactor_type == 'conventional':
             # Stirred tank agitation: 0.5 kW per m³ of each CSTR
             stage_power = V_stage * 0.5
-            Design['Extractor power per CSTR'] = 0  # not used for costing
+            Design['Extractor power per vessel'] = 0  # not used for costing
             Design['Extractor power'] = 0
         elif self._reactor_type == 'ultrasound':
-            # UAE: volumetric power density applied to each CSTR's volume
+            # UAE: volumetric power density applied to the extractor volume
             # (V = flow x residence time), so total power scales with V.
             stage_power = self.UAE_POWER_DENSITY * V_stage_L / 1000  # W -> kW
-            Design['Extractor power per CSTR'] = stage_power
+            Design['Extractor power per vessel'] = stage_power
             Design['Extractor power'] = stage_power * N
         elif self._reactor_type == 'microwave':
-            # MAE: volumetric power density applied to each CSTR's volume.
+            # MAE: volumetric power density applied to the extractor volume.
             stage_power = self.MAE_POWER_DENSITY * V_stage_L / 1000  # W -> kW
-            Design['Extractor power per CSTR'] = stage_power
+            Design['Extractor power per vessel'] = stage_power
             Design['Extractor power'] = stage_power * N
 
         tank_power = stage_power * N
@@ -1823,17 +1842,18 @@ class SolidSolventExtractor(Unit):
         """Calculate equipment costs based on reactor type.
 
         The centrifuge cost (single unit) is handled by the @cost decorator.
-        The extractor cost is one CSTR costed on its own size, times N_stages.
+        The extractor cost is one vessel costed on its own size, times the
+        number of vessels (N_stages CSTRs for conventional, 1 for UAE/MAE).
         """
-        N = int(self.N_stages)
+        N = self.n_vessels
         # Determine equipment name and register bare-module factor
         # before any cost assignments to avoid BioSTEAM warnings
         if self._reactor_type == 'conventional':
             equip_name = f'Mixing tanks ({N} CSTRs)'
         elif self._reactor_type == 'ultrasound':
-            equip_name = f'Ultrasound extractors ({N} CSTRs)'
+            equip_name = 'Ultrasound extractor'
         elif self._reactor_type == 'microwave':
-            equip_name = f'Microwave extractors ({N} CSTRs)'
+            equip_name = 'Microwave extractor'
 
         params = self.EXTRACTOR_COST_PARAMS[self._reactor_type]
         self.F_BM[equip_name] = params['BM']
@@ -1846,17 +1866,17 @@ class SolidSolventExtractor(Unit):
 
         Design = self.design_results
 
-        # Per-CSTR design value for the costing basis
+        # Per-vessel design value for the costing basis
         design_value = Design[params['basis']]
         design_value = max(design_value, 1e-6)  # Avoid zero division
 
-        # Scale the reference cost for ONE CSTR: C = C_ref * (S / S_ref)^n
+        # Scale the reference cost for ONE vessel: C = C_ref * (S / S_ref)^n
         S_ref = params['S']
         C_ref = params['cost']
         n = params['n']
         cost_per_stage = C_ref * (design_value / S_ref) ** n
 
-        # N identical CSTRs
+        # N identical vessels
         scaled_cost = cost_per_stage * N
 
         # Adjust for CEPCI
