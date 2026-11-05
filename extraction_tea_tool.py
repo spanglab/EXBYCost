@@ -2185,6 +2185,16 @@ def _calc_residual_price(feed_price, moisture_feed, moisture_res,
 # feed mass that actually reaches the extractor: the dried feed (dry solids
 # plus residual moisture) when the feed dryer is on, otherwise the feed as
 # received. Drying removes water, so less solvent is needed for the same 15%.
+# ── Wegstein time limit ─────────────────────────────────────────────
+# Wall-clock cap (minutes) on the Wegstein recycle solve for one point.
+# When it runs out, the point is NOT dropped: the solve switches to the
+# fixed-point fallback (capped at 30 passes) from where Wegstein left off.
+# Normal points finish in ~2-4 min and never reach it. In the Nov 2026
+# sweep a point that never converged spent 6.3 h in Wegstein; with this
+# limit it hands over to fixed-point after 20 min instead.
+# Set to None to give Wegstein its full 60 passes.
+WEGSTEIN_TIME_LIMIT_MIN = 20
+
 MAX_BIOMASS_WT_FRAC = 0.15
 MIN_SOLV_FEED_RATIO = (1.0 - MAX_BIOMASS_WT_FRAC) / MAX_BIOMASS_WT_FRAC  # ≈ 5.667 kg/kg
 
@@ -4741,7 +4751,8 @@ def _run_one_simulation(p, *, display=True):
                 _MIN_PURGE_FRAC = 0.001   # always purge >= 0.1% (recycle <= 99.9%)
 
                 # Live progress for the recycle solve (Wegstein count).
-                _recycle_progress = {'wegstein': 0}
+                _recycle_progress = {'wegstein': 0, 't0': None,
+                                     'limit_min': None}
                 _recycle_status = st.empty() if display else _NoopUI()
 
                 def _update_recycle_status():
@@ -4819,6 +4830,18 @@ def _run_one_simulation(p, *, display=True):
                     import math
                     _recycle_progress['wegstein'] += 1
                     _update_recycle_status()
+                    # Wall-clock limit on the Wegstein phase (see
+                    # WEGSTEIN_TIME_LIMIT_MIN). Checked once per pass. The
+                    # message contains 'could not converge' on purpose, so
+                    # the caller hands over to the fixed-point fallback.
+                    _t0 = _recycle_progress['t0']
+                    _lim = _recycle_progress['limit_min']
+                    if (_t0 is not None and _lim
+                            and time.time() - _t0 > _lim * 60.0):
+                        raise RuntimeError(
+                            f"Wegstein could not converge within the "
+                            f"{_lim:g}-minute time limit "
+                            f"({_recycle_progress['wegstein']} pass(es)).")
                     r_solv = recycle.imass[solv]
                     if not math.isfinite(r_solv) or r_solv < 0:
                         r_solv = 0.0
@@ -5106,13 +5129,47 @@ def _run_one_simulation(p, *, display=True):
                 sys.molar_tolerance          = 1e-2
                 sys.relative_molar_tolerance = 1e-3
                 sys.method                   = 'wegstein'
-                sys.maxiter                  = 200
+                # Normal points settle in a handful of passes; a pass on a
+                # hard point costs ~2 min, so a high cap mostly burns time
+                # on points that will not converge (200 passes took 6.3 h).
+                sys.maxiter                  = 60
 
                 _advance_progress()  # Stage 4: solving recycle
+                _recycle_progress['t0'] = time.time()
+                _recycle_progress['limit_min'] = WEGSTEIN_TIME_LIMIT_MIN
                 _recycle_spinner = (st.spinner("Solving recycle loop ...")
                                     if display else contextlib.nullcontext())
                 with _recycle_spinner:
-                    _simulate_with_evap_retry()
+                    _recycle_method_used = 'wegstein'
+                    try:
+                        _simulate_with_evap_retry()
+                    except Exception as _conv_err:
+                        # Exception, not RuntimeError: BioSTEAM may re-raise
+                        # an error from a unit specification as another type.
+                        if "could not converge" not in str(_conv_err):
+                            raise
+                        # Wegstein extrapolates, so it can oscillate forever
+                        # when something inside the loop switches on/off
+                        # between passes (e.g. the evaporator flipping
+                        # between its rigorous flash and the limiting-split
+                        # fallback). Retry with plain successive
+                        # substitution, which is slower but does not
+                        # extrapolate. Only failed points reach this branch,
+                        # so normal runs are unaffected. Capped at 30
+                        # passes (~1 h worst case): if it has not settled
+                        # by then it is unlikely to, and the point is
+                        # recorded as failed.
+                        # The time limit applies to Wegstein only; the
+                        # fallback is bounded by its pass cap instead.
+                        _recycle_progress['limit_min'] = None
+                        sys.method = 'fixed-point'
+                        sys.maxiter = 30
+                        _simulate_with_evap_retry()
+                        _recycle_method_used = 'fixed-point (fallback)'
+                        _run_status_lines.append(
+                            "Wegstein did not converge (60 passes or "
+                            f"{WEGSTEIN_TIME_LIMIT_MIN} min); "
+                            "recycle solved by fixed-point instead.")
 
                     # Post-simulation sanity check. Hard physical ceiling
                     # on the recycle mixer M2 = recycle + purge:
@@ -5733,6 +5790,9 @@ def _run_one_simulation(p, *, display=True):
                                  if hasattr(S1.split, '__len__')
                                  else float(S1.split))
                 scalars.update({
+                    'recycle_solver':         _recycle_method_used,
+                    # Total recycle passes (Wegstein + any fallback).
+                    'recycle_passes':         _recycle_progress['wegstein'],
                     'recycle_split':          _split_scalar,
                     'purge_fraction':         1.0 - _split_scalar,
                     'impurity_frac_at_inlet': _imp_frac_scalar,
@@ -5744,6 +5804,8 @@ def _run_one_simulation(p, *, display=True):
                 })
             else:
                 scalars.update({
+                    'recycle_solver':         None,
+                    'recycle_passes':         None,
                     'recycle_split':          None,
                     'purge_fraction':         None,
                     'impurity_frac_at_inlet': None,
