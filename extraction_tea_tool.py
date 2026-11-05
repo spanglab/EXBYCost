@@ -1408,6 +1408,68 @@ def _make_sweep_values(spec):
 # around, so the total is 1 + 2 x (selected parameters).
 # ============================================================================
 
+# Parameter keys of the form 'comp__<compound>' set that compound's dry-basis
+# content in mg/g for one run (see _apply_comp_overrides).
+COMP_KEY_PREFIX = 'comp__'
+
+
+def _apply_comp_overrides(names, comp, overrides_mg_g, mode='balance',
+                          balance=None):
+    """Return a new dry-basis mass-fraction list with some compounds fixed.
+
+    names / comp : the feedstock's compound names and mass fractions.
+    overrides_mg_g : {compound: mg per g dry feed}.
+    mode : 'balance' -> the balance compound (Unknown) absorbs the change;
+           falls back to 'proportional' if it would go negative or there
+           is none. 'proportional' -> every non-fixed compound is scaled
+           by the same factor.
+    Returns (new_comp, note).
+    """
+    x = np.asarray(comp, dtype=float)
+    tot = x.sum()
+    if tot <= 0:
+        raise ValueError("Feedstock composition sums to zero.")
+    x = x / tot
+    fixed = np.zeros(len(x), dtype=bool)
+    for name, mg in overrides_mg_g.items():
+        idx = [i for i, n in enumerate(names) if n == name]
+        if not idx:
+            raise ValueError(f"Compound '{name}' is not in this feedstock "
+                             f"(was the feedstock changed?).")
+        target = float(mg) / 1000.0
+        if target < 0:
+            raise ValueError(f"Negative content for '{name}'.")
+        # Duplicate entries of one compound keep their relative shares.
+        share = x[idx].sum()
+        for i in idx:
+            x[i] = target * (x[i] / share if share > 0 else 1.0 / len(idx))
+            fixed[i] = True
+    rest = 1.0 - x[fixed].sum()
+    if rest < -1e-9:
+        raise ValueError("Varied compounds exceed 1 000 mg/g dry feed.")
+    rest = max(rest, 0.0)
+    note = ''
+    if mode == 'balance' and balance in names and balance not in overrides_mg_g:
+        b = [i for i, n in enumerate(names) if n == balance]
+        others = x[~fixed].sum() - x[b].sum()
+        new_b = rest - others
+        if new_b >= 0:
+            bshare = x[b].sum()
+            for i in b:
+                x[i] = new_b * (x[i] / bshare if bshare > 0 else 1.0 / len(b))
+            return list(x), f"balanced with {balance}"
+        note = (f"{balance} would go negative; other compounds scaled "
+                f"proportionally instead")
+    free = ~fixed
+    s = x[free].sum()
+    if s <= 0:
+        if rest > 1e-9:
+            raise ValueError("No other compounds left to balance the change.")
+    else:
+        x[free] *= rest / s
+    return list(x), note or "other compounds scaled proportionally"
+
+
 def _sens_central_value(key, spec=None):
     """Current sidebar value of a parameter, used as its central case.
 
@@ -2185,16 +2247,6 @@ def _calc_residual_price(feed_price, moisture_feed, moisture_res,
 # feed mass that actually reaches the extractor: the dried feed (dry solids
 # plus residual moisture) when the feed dryer is on, otherwise the feed as
 # received. Drying removes water, so less solvent is needed for the same 15%.
-# ── Wegstein time limit ─────────────────────────────────────────────
-# Wall-clock cap (minutes) on the Wegstein recycle solve for one point.
-# When it runs out, the point is NOT dropped: the solve switches to the
-# fixed-point fallback (capped at 30 passes) from where Wegstein left off.
-# Normal points finish in ~2-4 min and never reach it. In the Nov 2026
-# sweep a point that never converged spent 6.3 h in Wegstein; with this
-# limit it hands over to fixed-point after 20 min instead.
-# Set to None to give Wegstein its full 60 passes.
-WEGSTEIN_TIME_LIMIT_MIN = 20
-
 MAX_BIOMASS_WT_FRAC = 0.15
 MIN_SOLV_FEED_RATIO = (1.0 - MAX_BIOMASS_WT_FRAC) / MAX_BIOMASS_WT_FRAC  # ≈ 5.667 kg/kg
 
@@ -2885,6 +2937,67 @@ feed_dryer_efficiency = 0.70  # fraction of supplied heat reaching the solids;
 feed_dryer_U = 60             # W/(m²·K) on the tube area, steam-tube rotary
                               # dryer on wet granular solids (Perry's §12)
 
+# ── Unit-model parameters (defaults above; editable here) ─────────────
+# These were hardcoded. They are exposed so a Single Run can change them,
+# and so the Parameter Sweep / Sensitivity Analysis panels have a central
+# value to vary around.
+VDD_U_DEFAULT = 0.182         # kW/(m²·K), VacuumDrumDryer default (ECN)
+FEED_DRY_RH_DEFAULT = 0.80    # exhaust relative humidity, feedstock dryer D101
+RECYCLE_SPLIT_MAX_DEFAULT = 0.999   # = 1 - _MIN_PURGE_FRAC in the recycle loop
+
+
+def _extractor_default(name, fallback):
+    """Default of a SolidSolventExtractor setting, read from the class so the
+    central value here always matches what the extractor would use."""
+    import inspect
+    try:
+        par = inspect.signature(SolidSolventExtractor._init).parameters.get(name)
+        if par is not None and par.default is not inspect.Parameter.empty:
+            return float(par.default)
+    except (TypeError, ValueError):
+        pass
+    val = getattr(SolidSolventExtractor, name, None)
+    return float(val) if isinstance(val, (int, float)) else float(fallback)
+
+
+CAKE_LIQUID_DEFAULT = _extractor_default('cake_liquid_content', 0.40)
+
+with st.sidebar.expander("⚙️ Unit-model parameters", expanded=False):
+    st.caption("Defaults are the literature values used before. In "
+               "Parameter Sweep / Sensitivity Analysis these are the "
+               "central values.")
+    cake_liquid_content = st.number_input(
+        "Centrifuge cake liquid content (wt frac)",
+        min_value=0.05, max_value=0.90, value=float(CAKE_LIQUID_DEFAULT),
+        step=0.05, format="%.3f", key="cake_liquid_content",
+        help="Liquid (solvent + dissolved extract) held in the extractor "
+             "centrifuge cake, as a mass fraction of the wet cake. Liquid "
+             "left in the cake is lost to the residual drum dryer.")
+    feed_dry_RH = st.number_input(
+        "Feedstock dryer exhaust relative humidity (frac)",
+        min_value=0.05, max_value=0.99, value=FEED_DRY_RH_DEFAULT,
+        step=0.05, format="%.2f", key="feed_dry_RH",
+        help="RH of the D101 drum-dryer exhaust air. Lower RH = more "
+             "drying air per kg water and a larger heating duty.")
+    solid_cooler_U = st.number_input(
+        "Solid coolers U (W/m²·K)",
+        min_value=1.0, max_value=500.0, value=float(solid_cooler_U),
+        step=5.0, format="%.1f", key="solid_cooler_U",
+        help="Dried-feed cooler and product cooler (indirect rotary "
+             "drum coolers). Literature 13–50 W/m²·K.")
+    feed_dryer_U = st.number_input(
+        "Residual drum dryer U (W/m²·K)",
+        min_value=1.0, max_value=500.0, value=float(feed_dryer_U),
+        step=5.0, format="%.1f", key="feed_dryer_U",
+        help="Steam-tube rotary dryer for the solvent-wet residual cake.")
+    vdd_U = st.number_input(
+        "Vacuum drum dryer U (kW/m²·K)",
+        min_value=0.01, max_value=2.0, value=VDD_U_DEFAULT,
+        step=0.02, format="%.3f", key="vdd_U",
+        help="Only used when the product dryer is the vacuum drum dryer. "
+             "The spray dryer and the feedstock drum dryer (D101) are not "
+             "sized on U.")
+
 # =========================================================================
 # 2c. Solvent Recycle
 # =========================================================================
@@ -2908,6 +3021,17 @@ recycle_x_max = st.sidebar.number_input(
           "bisection to satisfy this cap."),
     disabled=not enable_recycle,
 ) / 100.0
+recycle_split_max = st.sidebar.number_input(
+    "Max recycle ratio (frac of recovered solvent)",
+    min_value=0.0, max_value=RECYCLE_SPLIT_MAX_DEFAULT,
+    value=RECYCLE_SPLIT_MAX_DEFAULT, step=0.05, format="%.3f",
+    key="recycle_split_max",
+    help=("Upper limit on the fraction of the recovered condensate sent "
+          "back to the extractor (the rest is purged). The split is still "
+          "solved from the impurity cap and the makeup balance; this only "
+          "lowers the ceiling. 0.999 = no extra limit."),
+    disabled=not enable_recycle,
+)
 # =========================================================================
 # 3. TEA Settings
 # =========================================================================
@@ -3315,8 +3439,18 @@ else:
 # label, hard bounds matching the original widget, a "good" default for
 # the sweep range, a printf-style format, and the cast for sweep values
 # (None = float, int = round-to-int + dedupe).
+# Central values of the feedstock-property overrides. In the model they are
+# p['feed_moisture'] / p['deff_ratio'] (None = use the feedstock's own data),
+# so these globals only feed _sens_central_value().
+feed_moisture = float(_as_received_moisture)
+deff_ratio = float(feedstock_deff(selected_feedstock)['value'])
+
 NUMERIC_SWEEP_SPECS = {
+    # Feedstock properties (override the database values for this run)
+    'feed_moisture':      {'label': 'As-received feed moisture (wt frac, wet basis)', 'min': 0.0, 'max': 0.95, 'def_lo': 0.05, 'def_hi': 0.80, 'fmt': '%.4f', 'cast': None, 'group': 'Feedstock'},
+    'deff_ratio':         {'label': 'Porosity/tortuosity factor Deff/Dab (ε/τ)', 'min': 1e-4, 'max': 1.0, 'def_lo': 0.05, 'def_hi': 0.50, 'fmt': '%.4f', 'cast': None, 'group': 'Feedstock'},
     # Feed drying (pre-storage drum dryer)
+    'feed_dry_RH':        {'label': 'Feed dryer exhaust relative humidity (frac)', 'min': 0.05, 'max': 0.99, 'def_lo': 0.50, 'def_hi': 0.90, 'fmt': '%.3f', 'cast': None, 'group': 'Feed drying'},
     # Upper bound tracks the selected feedstock: drying can only remove the
     # water that arrives with the feed.
     'feed_dry_moisture':  {'label': 'Feed moisture after drying (frac)', 'min': 0.005, 'max': float(_as_received_moisture), 'def_lo': min(0.04, float(_as_received_moisture)), 'def_hi': min(0.15, float(_as_received_moisture)), 'fmt': '%.4f', 'cast': None, 'group': 'Feed drying'},
@@ -3328,6 +3462,11 @@ NUMERIC_SWEEP_SPECS = {
     'extractt':        {'label': 'Extraction time (hr)',              'min': 0.1,    'max': 24.0,      'def_lo': 0.5,      'def_hi': 4.0,      'fmt': '%.3f',  'cast': None, 'group': 'Process'},
     'Particlesize':    {'label': 'Particle radius (cm)',              'min': MIN_PARTICLE_RADIUS, 'max': 5.0,       'def_lo': 0.1,      'def_hi': 1.0,      'fmt': '%.4f',  'cast': None, 'group': 'Process'},
     'ExtractP_custom': {'label': 'Extraction pressure (Pa, Custom mode)', 'min': 1000.0,'max': 1000000.0,'def_lo': 50000.0,'def_hi': 300000.0,'fmt': '%.0f', 'cast': None, 'group': 'Process'},
+    'cake_liquid_content': {'label': 'Centrifuge cake liquid content (wt frac)', 'min': 0.05, 'max': 0.90, 'def_lo': 0.25, 'def_hi': 0.55, 'fmt': '%.3f', 'cast': None, 'group': 'Process'},
+    # Heat transfer coefficients
+    'solid_cooler_U':     {'label': 'Solid coolers U (W/m²·K)',         'min': 1.0,    'max': 500.0,     'def_lo': 13.0,     'def_hi': 50.0,     'fmt': '%.1f',  'cast': None, 'group': 'Heat transfer'},
+    'feed_dryer_U':       {'label': 'Residual drum dryer U (W/m²·K)',   'min': 1.0,    'max': 500.0,     'def_lo': 30.0,     'def_hi': 120.0,    'fmt': '%.1f',  'cast': None, 'group': 'Heat transfer'},
+    'vdd_U':              {'label': 'Vacuum drum dryer U (kW/m²·K)',    'min': 0.01,   'max': 2.0,       'def_lo': 0.10,     'def_hi': 0.30,     'fmt': '%.3f',  'cast': None, 'group': 'Heat transfer'},
     # Concentration / drying
     'evap_n_effects':     {'label': 'Evaporator effects',             'min': 1,      'max': 5,         'def_lo': 1,        'def_hi': 5,        'fmt': '%d',    'cast': int,  'group': 'Concentration'},
     'evap_target_solids': {'label': 'Evaporator target solids (frac)','min': 0.10,   'max': 0.50,      'def_lo': 0.20,     'def_hi': 0.45,     'fmt': '%.3f',  'cast': None, 'group': 'Concentration'},
@@ -3338,6 +3477,7 @@ NUMERIC_SWEEP_SPECS = {
     'vdd_T_C':            {'label': 'Vacuum drum dryer temperature (°C)', 'min': VDD_T_MIN_C, 'max': VDD_T_MAX_C, 'def_lo': 40.0, 'def_hi': 80.0, 'fmt': '%.1f', 'cast': None, 'group': 'Concentration'},
     # Recycle
     'recycle_x_max':      {'label': 'Max impurity frac at inlet',      'min': 0.001,  'max': 0.20,      'def_lo': 0.005,    'def_hi': 0.05,     'fmt': '%.4f',  'cast': None, 'group': 'Recycle'},
+    'recycle_split_max':  {'label': 'Max recycle ratio (frac of recovered solvent)', 'min': 0.0, 'max': RECYCLE_SPLIT_MAX_DEFAULT, 'def_lo': 0.50, 'def_hi': 0.99, 'fmt': '%.3f', 'cast': None, 'group': 'Recycle'},
     # Economics
     'elec_price':         {'label': 'Electricity price ($/kWh)',       'min': 0.0,    'max': 1.0,       'def_lo': 0.10,     'def_hi': 0.30,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
     'feed_price':         {'label': 'Feed price ($/kg)',                'min': 0.0,    'max': 100.0,     'def_lo': 0.0,      'def_hi': 0.50,     'fmt': '%.4f',  'cast': None, 'group': 'Economics'},
@@ -3398,9 +3538,17 @@ operators_per_shift = operators_per_shift_input
 
 # Sidebar display order for the numeric parameter groups (shared by the
 # Parameter Sweep and Sensitivity Analysis configuration panels).
-SWEEP_GROUPS_ORDERED = ['Process', 'Feed drying', 'Concentration',
-                        'Recycle',
+SWEEP_GROUPS_ORDERED = ['Feedstock', 'Process', 'Feed drying',
+                        'Concentration', 'Recycle', 'Heat transfer',
                         'Economics', 'TEA']
+
+# How a change in one compound's content is balanced so the dry
+# composition still sums to 1 (sensitivity analysis only).
+COMP_COMPENSATE_OPTIONS = {
+    "Unknown (balance term)": 'balance',
+    "All other compounds, proportionally": 'proportional',
+}
+comp_compensate = 'balance'
 
 if sim_mode == "Parameter Sweep":
     st.sidebar.markdown("---")
@@ -3548,6 +3696,150 @@ if sim_mode == "Sensitivity Analysis":
              "still be given its own percentages or manual bounds.",
     )
 
+    def _sens_bounds_ui(k, spec, central):
+        """Bound widgets for one tested parameter; adds it to sens_specs."""
+        fmt = spec['fmt']
+        try:
+            central_txt = fmt % central
+        except (TypeError, ValueError):
+            central_txt = str(central)
+        st.caption(f"Central value: **{central_txt}**")
+
+        bound_mode = st.radio(
+            "Bounds from",
+            options=["± % of central", "Manual bounds"],
+            horizontal=True,
+            key=f"sens_{k}_bmode",
+            help="± %: bounds are the central value scaled down and "
+                 "up by the percentages given. Manual: type the "
+                 "lower and upper values directly.",
+        )
+
+        if bound_mode == "± % of central":
+            c1, c2 = st.columns(2)
+            with c1:
+                pct_down = st.number_input(
+                    "Decrease (−%)",
+                    min_value=0.0, max_value=100.0,
+                    value=float(sens_default_pct), step=1.0,
+                    key=f"sens_{k}_pdn",
+                )
+            with c2:
+                pct_up = st.number_input(
+                    "Increase (+%)",
+                    min_value=0.0, max_value=1000.0,
+                    value=float(sens_default_pct), step=1.0,
+                    key=f"sens_{k}_pup",
+                )
+            lo, cen, hi = _make_sensitivity_bounds(
+                central, spec, 'percent',
+                pct_down=pct_down, pct_up=pct_up)
+            bound_setting = f"-{pct_down:g}% / +{pct_up:g}%"
+        else:
+            _def_lo = (central * 0.8 if central
+                       else float(spec['def_lo']))
+            _def_hi = (central * 1.2 if central
+                       else float(spec['def_hi']))
+            c1, c2 = st.columns(2)
+            with c1:
+                man_lo = st.number_input(
+                    "Lower bound", key=f"sens_{k}_lo",
+                    **_num_input_kwargs(spec, _def_lo),
+                )
+            with c2:
+                man_hi = st.number_input(
+                    "Upper bound", key=f"sens_{k}_hi",
+                    **_num_input_kwargs(spec, _def_hi),
+                )
+            lo, cen, hi = _make_sensitivity_bounds(
+                central, spec, 'manual',
+                manual_lo=man_lo, manual_hi=man_hi)
+            bound_setting = "manual"
+
+        if hi < lo:
+            st.warning(
+                f"Upper bound must be at or above the lower bound "
+                f"for {spec['label']}."
+            )
+            return
+        if lo == hi == cen:
+            st.warning(
+                f"Bounds collapse onto the central value for "
+                f"{spec['label']} — nothing to vary."
+            )
+            return
+        if not (lo <= cen <= hi):
+            st.caption(
+                "ℹ️ The central value sits outside these bounds; the "
+                "baseline run still uses the central value."
+            )
+
+        sens_specs[k] = {
+            'label': spec['label'],
+            'low': lo, 'central': cen, 'high': hi,
+            'fmt': fmt, 'cast': spec['cast'],
+            'bound_mode': ('percent' if bound_mode.startswith('±')
+                           else 'manual'),
+            'bound_setting': bound_setting,
+        }
+        sens_summary_labels[k] = spec['label']
+
+        def _p(v):
+            try:
+                return fmt % v
+            except (TypeError, ValueError):
+                return str(v)
+        st.caption(
+            f"→ low **{_p(lo)}** · central **{_p(cen)}** · "
+            f"high **{_p(hi)}**"
+        )
+
+    def _sens_composition_ui():
+        """Pick feedstock compounds to vary (dry-basis mg/g)."""
+        global comp_compensate
+        st.markdown("**Compound content (dry basis)**")
+        _fs = feedstocks[selected_feedstock]
+        _lbls = MACRO_LABELS.get(selected_feedstock, {})
+        _comp = {}
+        for _e, _v in zip(_fs['chems'], _fs['comp']):
+            _n = _get_chem_name(_e)
+            _comp[_n] = _comp.get(_n, 0.0) + float(_v)
+        _tot = sum(_comp.values()) or 1.0
+
+        def _opt_label(n):
+            shown = _lbls.get(n, n)
+            shown = f"{shown} ({n})" if shown != n else n
+            return f"{shown} — {_fmt_mg_g(_comp[n] / _tot * 1000)} mg/g"
+
+        chosen = st.multiselect(
+            "Compounds to vary",
+            options=sorted(_comp, key=lambda n: -_comp[n]),
+            format_func=_opt_label,
+            key="sens_comp_compounds",
+            help="Each chosen compound is tested on its own (one at a "
+                 "time), like any other parameter. Values are mg per g "
+                 "of dry feed.",
+        )
+        _balance = (MACRO_REPORTS.get(selected_feedstock) or {}).get('balance')
+        _opts = list(COMP_COMPENSATE_OPTIONS)
+        if not _balance or _balance not in _comp:
+            _opts = _opts[1:]
+        if chosen:
+            comp_compensate = COMP_COMPENSATE_OPTIONS[st.radio(
+                "Balance the change with",
+                options=_opts, key="sens_comp_compensate",
+                help="The dry composition must still sum to 1 000 mg/g. "
+                     "'Unknown' takes up the whole change (falls back to "
+                     "proportional if it would go negative); "
+                     "'proportional' scales every other compound.")]
+        for n in chosen:
+            k = COMP_KEY_PREFIX + n
+            spec = {'label': f"{_lbls.get(n, n)} content (mg/g dry)",
+                    'min': 0.0, 'max': 1000.0, 'def_lo': 0.0,
+                    'def_hi': 1000.0, 'fmt': '%.3f', 'cast': None}
+            st.markdown(f"*{spec['label']}*")
+            _sens_bounds_ui(k, spec, _comp[n] / _tot * 1000.0)
+
     for group in SWEEP_GROUPS_ORDERED:
         group_keys = [k for k, s in NUMERIC_SWEEP_SPECS.items()
                       if s['group'] == group]
@@ -3555,8 +3847,16 @@ if sim_mode == "Sensitivity Analysis":
             continue
         n_active = sum(1 for k in group_keys
                        if st.session_state.get(f'sens_{k}', False))
+        if group == 'Feedstock':
+            n_active += len(st.session_state.get('sens_comp_compounds')
+                            or ())
         header = f"{group}  ·  {n_active} varied" if n_active else group
         with st.sidebar.expander(header, expanded=False):
+            if group == 'Feedstock':
+                st.caption(
+                    "Overrides the database values of the selected "
+                    "feedstock. Feed flow is on a wet basis, so a wetter "
+                    "feed means less dry solids at the same flow.")
             for k in group_keys:
                 spec = NUMERIC_SWEEP_SPECS[k]
                 enabled = st.checkbox(
@@ -3583,101 +3883,10 @@ if sim_mode == "Sensitivity Analysis":
                         **_num_input_kwargs(
                             spec, (spec['def_lo'] + spec['def_hi']) / 2.0),
                     )
-                fmt = spec['fmt']
-                try:
-                    central_txt = fmt % central
-                except (TypeError, ValueError):
-                    central_txt = str(central)
-                st.caption(f"Central value: **{central_txt}**")
-
-                bound_mode = st.radio(
-                    "Bounds from",
-                    options=["± % of central", "Manual bounds"],
-                    horizontal=True,
-                    key=f"sens_{k}_bmode",
-                    help="± %: bounds are the central value scaled down and "
-                         "up by the percentages given. Manual: type the "
-                         "lower and upper values directly.",
-                )
-
-                if bound_mode == "± % of central":
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        pct_down = st.number_input(
-                            "Decrease (−%)",
-                            min_value=0.0, max_value=100.0,
-                            value=float(sens_default_pct), step=1.0,
-                            key=f"sens_{k}_pdn",
-                        )
-                    with c2:
-                        pct_up = st.number_input(
-                            "Increase (+%)",
-                            min_value=0.0, max_value=1000.0,
-                            value=float(sens_default_pct), step=1.0,
-                            key=f"sens_{k}_pup",
-                        )
-                    lo, cen, hi = _make_sensitivity_bounds(
-                        central, spec, 'percent',
-                        pct_down=pct_down, pct_up=pct_up)
-                    bound_setting = f"-{pct_down:g}% / +{pct_up:g}%"
-                else:
-                    _def_lo = (central * 0.8 if central
-                               else float(spec['def_lo']))
-                    _def_hi = (central * 1.2 if central
-                               else float(spec['def_hi']))
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        man_lo = st.number_input(
-                            "Lower bound", key=f"sens_{k}_lo",
-                            **_num_input_kwargs(spec, _def_lo),
-                        )
-                    with c2:
-                        man_hi = st.number_input(
-                            "Upper bound", key=f"sens_{k}_hi",
-                            **_num_input_kwargs(spec, _def_hi),
-                        )
-                    lo, cen, hi = _make_sensitivity_bounds(
-                        central, spec, 'manual',
-                        manual_lo=man_lo, manual_hi=man_hi)
-                    bound_setting = "manual"
-
-                if hi < lo:
-                    st.warning(
-                        f"Upper bound must be at or above the lower bound "
-                        f"for {spec['label']}."
-                    )
-                    continue
-                if lo == hi == cen:
-                    st.warning(
-                        f"Bounds collapse onto the central value for "
-                        f"{spec['label']} — nothing to vary."
-                    )
-                    continue
-                if not (lo <= cen <= hi):
-                    st.caption(
-                        "ℹ️ The central value sits outside these bounds; the "
-                        "baseline run still uses the central value."
-                    )
-
-                sens_specs[k] = {
-                    'label': spec['label'],
-                    'low': lo, 'central': cen, 'high': hi,
-                    'fmt': fmt, 'cast': spec['cast'],
-                    'bound_mode': ('percent' if bound_mode.startswith('±')
-                                   else 'manual'),
-                    'bound_setting': bound_setting,
-                }
-                sens_summary_labels[k] = spec['label']
-
-                def _p(v):
-                    try:
-                        return fmt % v
-                    except (TypeError, ValueError):
-                        return str(v)
-                st.caption(
-                    f"→ low **{_p(lo)}** · central **{_p(cen)}** · "
-                    f"high **{_p(hi)}**"
-                )
+                _sens_bounds_ui(k, spec, central)
+            if group == 'Feedstock':
+                st.markdown("---")
+                _sens_composition_ui()
 
     if sens_specs:
         _n_legs = sum(1 for s in sens_specs.values()
@@ -3841,9 +4050,11 @@ def _run_one_simulation(p, *, display=True):
     # solvent flow or ratio, and params dicts saved before this limit.
     # Applied to the feed mass reaching the extractor, so the per-run
     # feedstock and drying settings (which may be swept) set the minimum.
+    _moisture_override = p.get('feed_moisture')
     solvflow, _solv_raised = _enforce_min_solvent(
         solvflow, feedflow,
-        feedstocks[p['selected_feedstock']]['moisture'],
+        (float(_moisture_override) if _moisture_override is not None
+         else feedstocks[p['selected_feedstock']]['moisture']),
         p.get('feed_dry_enable', True),
         p.get('feed_dry_moisture', 0.06))
     ExtractT                = p['ExtractT']
@@ -3934,6 +4145,16 @@ def _run_one_simulation(p, *, display=True):
     finance_interest        = p['finance_interest']
     finance_years           = int(p['finance_years'])
     finance_fraction        = p['finance_fraction']
+    # Unit-model parameters (older params dicts fall back to the defaults).
+    _cooler_U               = float(p.get('solid_cooler_U') or solid_cooler_U)
+    _res_dryer_U            = float(p.get('feed_dryer_U') or feed_dryer_U)
+    _vdd_U                  = float(p.get('vdd_U') or VDD_U_DEFAULT)
+    _feed_dry_RH            = float(p.get('feed_dry_RH') or FEED_DRY_RH_DEFAULT)
+    _cake_liquid            = p.get('cake_liquid_content')
+    _recycle_split_max      = p.get('recycle_split_max')
+    _recycle_split_max      = (RECYCLE_SPLIT_MAX_DEFAULT
+                               if _recycle_split_max is None
+                               else float(_recycle_split_max))
 
     _spinner_ctx = (st.spinner("Running simulation... This may take a moment.")
                     if display else contextlib.nullcontext())
@@ -3985,6 +4206,22 @@ def _run_one_simulation(p, *, display=True):
             feedchems = [_get_chem_name(c) for c in feedchem_entries]   # plain name list
             feedcomp = feedstocks[selected_feedstock]['comp']
             moisture = feedstocks[selected_feedstock]['moisture']
+            # Sweep / sensitivity overrides of the feedstock itself.
+            if _moisture_override is not None:
+                moisture = float(_moisture_override)
+            if not (0.0 <= moisture < 1.0):
+                raise ValueError(f"Feed moisture {moisture} must be in [0, 1).")
+            _comp_overrides = {k[len(COMP_KEY_PREFIX):]: v
+                               for k, v in p.items()
+                               if k.startswith(COMP_KEY_PREFIX)
+                               and v is not None}
+            _comp_note = ''
+            if _comp_overrides:
+                feedcomp, _comp_note = _apply_comp_overrides(
+                    feedchems, feedcomp, _comp_overrides,
+                    mode=p.get('comp_compensate', 'balance'),
+                    balance=(MACRO_REPORTS.get(selected_feedstock)
+                             or {}).get('balance'))
             # The drum dryer removes water; it cannot add it. If a sweep
             # pairs a drying target with a feedstock that arrives drier
             # than that target, hold the target at the incoming moisture
@@ -3993,6 +4230,11 @@ def _run_one_simulation(p, *, display=True):
             feedstock_type = feedstocks[selected_feedstock]['type']
             _deff = feedstock_deff(selected_feedstock)
             porosity_tortuosity_ratio = _deff['value']
+            if p.get('deff_ratio') is not None:
+                porosity_tortuosity_ratio = float(p['deff_ratio'])
+                _deff = {**_deff, 'basis': 'user override',
+                         'note': f"set to {porosity_tortuosity_ratio:.4g} "
+                                 f"(database {_deff['value']:.4g})"}
 
             # Get solvent price. A value supplied in p (sidebar Custom, or a
             # sweep/sensitivity override) wins; otherwise look it up for the
@@ -4387,7 +4629,7 @@ def _run_one_simulation(p, *, display=True):
                     # flow and the heating duty. RH is BioSTEAM's default,
                     # stated explicitly so it is reported.
                     P=101325.,
-                    RH=0.80,
+                    RH=_feed_dry_RH,
                     # Sized to dry the year's feed within the harvest
                     # months (12 = year-round, no scale-up).
                     harvest_months=_harvest_n,
@@ -4398,7 +4640,7 @@ def _run_one_simulation(p, *, display=True):
                     ins=dried_feed,
                     outs=[cooled_feed],
                     T_target=FEED_COOL_T,
-                    U=solid_cooler_U)
+                    U=_cooler_U)
                 _feed_to_storage = C101 - 0
             else:
                 D101 = None
@@ -4460,6 +4702,12 @@ def _run_one_simulation(p, *, display=True):
                                          reactor_type=reactor_type,
                                          particle_radius=Particlesize,
                                          porosity_tortuosity_ratio=porosity_tortuosity_ratio)
+            if _cake_liquid is not None:
+                if not hasattr(E201, 'cake_liquid_content'):
+                    raise AttributeError(
+                        "SolidSolventExtractor has no 'cake_liquid_content' "
+                        "attribute, so the cake liquid content cannot be set.")
+                E201.cake_liquid_content = float(_cake_liquid)
 
             # ── Evaporator + Spray Dryer ──────────────────────────────
             solvent_CAS = tmo.settings.chemicals[solv].CAS
@@ -4631,7 +4879,8 @@ def _run_one_simulation(p, *, display=True):
                     solvent=solv,
                     moisture_content=dryer_moisture,
                     T=float(vdd_T_C) + 273.15,
-                    thermal_efficiency=0.95)
+                    thermal_efficiency=0.95,
+                    U=_vdd_U)
             else:
                 SD1 = SolventSprayDryer('Spray Dryer',
                     ins=E301.outs[0],
@@ -4665,7 +4914,7 @@ def _run_one_simulation(p, *, display=True):
                 ins=_to_product_cooler,
                 outs=[cooled_product],
                 T_target=298.15,  # 25 °C (room temperature)
-                U=solid_cooler_U)
+                U=_cooler_U)
 
             # ── Residual Dryer ────────────────────────────────────
             # The centrifuge cake (solid_residual) leaves the extractor wet
@@ -4689,7 +4938,7 @@ def _run_one_simulation(p, *, display=True):
                 moisture_content=dryer_moisture,
                 T=tmo.settings.chemicals[solv].Tb + 10,
                 thermal_efficiency=feed_dryer_efficiency,
-                U=feed_dryer_U)
+                U=_res_dryer_U)
 
             # ── Solvent-recycle units ─────────────────────────────
             # H1 condenses the dryer vapor (gas) to a liquid so it can mix
@@ -4751,8 +5000,7 @@ def _run_one_simulation(p, *, display=True):
                 _MIN_PURGE_FRAC = 0.001   # always purge >= 0.1% (recycle <= 99.9%)
 
                 # Live progress for the recycle solve (Wegstein count).
-                _recycle_progress = {'wegstein': 0, 't0': None,
-                                     'limit_min': None}
+                _recycle_progress = {'wegstein': 0}
                 _recycle_status = st.empty() if display else _NoopUI()
 
                 def _update_recycle_status():
@@ -4822,7 +5070,8 @@ def _run_one_simulation(p, *, display=True):
                     split = solv_recycle / solv_m2
                     # clamp so the loop always keeps an exit
                     S1.split = min(max(split, 0.0),
-                                   1.0 - _MIN_PURGE_FRAC)
+                                   1.0 - _MIN_PURGE_FRAC,
+                                   _recycle_split_max)
 
                 S1.add_specification(adjust_recycle_split, run=True)
 
@@ -4830,18 +5079,6 @@ def _run_one_simulation(p, *, display=True):
                     import math
                     _recycle_progress['wegstein'] += 1
                     _update_recycle_status()
-                    # Wall-clock limit on the Wegstein phase (see
-                    # WEGSTEIN_TIME_LIMIT_MIN). Checked once per pass. The
-                    # message contains 'could not converge' on purpose, so
-                    # the caller hands over to the fixed-point fallback.
-                    _t0 = _recycle_progress['t0']
-                    _lim = _recycle_progress['limit_min']
-                    if (_t0 is not None and _lim
-                            and time.time() - _t0 > _lim * 60.0):
-                        raise RuntimeError(
-                            f"Wegstein could not converge within the "
-                            f"{_lim:g}-minute time limit "
-                            f"({_recycle_progress['wegstein']} pass(es)).")
                     r_solv = recycle.imass[solv]
                     if not math.isfinite(r_solv) or r_solv < 0:
                         r_solv = 0.0
@@ -5135,17 +5372,13 @@ def _run_one_simulation(p, *, display=True):
                 sys.maxiter                  = 60
 
                 _advance_progress()  # Stage 4: solving recycle
-                _recycle_progress['t0'] = time.time()
-                _recycle_progress['limit_min'] = WEGSTEIN_TIME_LIMIT_MIN
                 _recycle_spinner = (st.spinner("Solving recycle loop ...")
                                     if display else contextlib.nullcontext())
                 with _recycle_spinner:
                     _recycle_method_used = 'wegstein'
                     try:
                         _simulate_with_evap_retry()
-                    except Exception as _conv_err:
-                        # Exception, not RuntimeError: BioSTEAM may re-raise
-                        # an error from a unit specification as another type.
+                    except RuntimeError as _conv_err:
                         if "could not converge" not in str(_conv_err):
                             raise
                         # Wegstein extrapolates, so it can oscillate forever
@@ -5159,16 +5392,12 @@ def _run_one_simulation(p, *, display=True):
                         # passes (~1 h worst case): if it has not settled
                         # by then it is unlikely to, and the point is
                         # recorded as failed.
-                        # The time limit applies to Wegstein only; the
-                        # fallback is bounded by its pass cap instead.
-                        _recycle_progress['limit_min'] = None
                         sys.method = 'fixed-point'
                         sys.maxiter = 30
                         _simulate_with_evap_retry()
                         _recycle_method_used = 'fixed-point (fallback)'
                         _run_status_lines.append(
-                            "Wegstein did not converge (60 passes or "
-                            f"{WEGSTEIN_TIME_LIMIT_MIN} min); "
+                            "Wegstein did not converge in 60 passes; "
                             "recycle solved by fixed-point instead.")
 
                     # Post-simulation sanity check. Hard physical ceiling
@@ -5666,6 +5895,18 @@ def _run_one_simulation(p, *, display=True):
                 'feed_dry_T_C':         (feed_dry_T if feed_dry_enable
                                          else None),
                 'feed_moisture_as_received': moisture,
+                'composition_override': (
+                    "; ".join(f"{k}={v:.4g} mg/g" for k, v in
+                              _comp_overrides.items())
+                    + (f" ({_comp_note})" if _comp_note else "")
+                    if _comp_overrides else ''),
+                'cake_liquid_content': (
+                    float(getattr(E201, 'cake_liquid_content', float('nan')))),
+                'feed_dry_RH':          _feed_dry_RH,
+                'solid_cooler_U_W_m2K': _cooler_U,
+                'residual_dryer_U_W_m2K': _res_dryer_U,
+                'vdd_U_kW_m2K':         _vdd_U,
+                'recycle_split_max':    _recycle_split_max,
                 'feed_water_evaporated_kg_per_hr': (
                     # water only: the hot-gas outlet also carries drying air
                     float(feed_dryer_vapor.imass['Water'])
@@ -7054,6 +7295,18 @@ def _collect_base_params():
         'finance_interest':         finance_interest,
         'finance_years':            finance_years,
         'finance_fraction':         finance_fraction,
+        # Feedstock overrides: None = the feedstock's own data, so a sweep
+        # over feedstocks still uses each one's moisture / Deff.
+        'feed_moisture':            None,
+        'deff_ratio':               None,
+        'comp_compensate':          comp_compensate,
+        # Unit-model parameters
+        'cake_liquid_content':      cake_liquid_content,
+        'feed_dry_RH':              feed_dry_RH,
+        'solid_cooler_U':           solid_cooler_U,
+        'feed_dryer_U':             feed_dryer_U,
+        'vdd_U':                    vdd_U,
+        'recycle_split_max':        recycle_split_max,
     }
 
 
