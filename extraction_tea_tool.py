@@ -1295,7 +1295,7 @@ st.set_page_config(
 
 st.title("EXBYCost")
 st.markdown(
-    "##### A fast, flexible techno-economic modeling tool for estimating "
+    "##### A techno-economic modeling tool for estimating "
     "extraction costs from food processing byproducts"
    )
 st.markdown( "developed by the Spang lab at the University of California, Davis")
