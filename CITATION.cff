@@ -1,0 +1,86 @@
+cff-version: 1.2.0
+message: "If you use EXBYCost, please cite it using the metadata from this file."
+type: software
+
+title: "EXBYCost: a techno-economic modeling tool for estimating extraction costs from food processing byproducts"
+abstract: >-
+  EXBYCost is a techno-economic analysis (TEA) tool for
+  estimating the cost of extracting valuable compounds from food processing
+  byproducts. Built on the BioSTEAM process simulation framework and delivered
+  as an interactive Streamlit web application, it simulates a complete
+  solid-liquid extraction process, including feedstock drying and milling,
+  solvent extraction, solvent recovery by multi-effect evaporation with
+  recycle, and product drying without the need for adding extra experimental data
+  It reports the capital cost breakdown, annual
+  operating costs, stream and mass balance information, and the minimum
+  product selling price, together with its cost contributions. EXBYCost also
+  supports parameter sweeps and sensitivity analysis of the minimum selling
+  price, and flags compounds at risk of thermal degradation under the
+  selected process conditions.
+
+authors:
+  # Order is citation order.
+  - given-names: "Kieran"
+    family-names: "Heeley"
+    email: "Kheeley@ucdavis.edu"   # optional: delete this line if you don't want your email public
+    affiliation: "Department of Food Science and Technology, University of California, Davis, California, USA"
+    # orcid: "https://orcid.org/REPLACE"   # add your own ORCID here
+  - given-names: "Juliana Maria Leite Nobrega"
+    name-particle: "de"
+    family-names: "Moura Bell"
+    affiliation: "Department of Food Science and Technology, University of California, Davis, California, USA"
+    orcid: "https://orcid.org/0000-0003-1195-2616"
+  - given-names: "Sarang S."
+    family-names: "Bhagwat"
+    affiliation: "Energy & Biosciences Institute, University of California, Berkeley, California, USA"
+    orcid: "https://orcid.org/0000-0002-2620-2829"
+  - given-names: "Corinne D."
+    family-names: "Scown"
+    affiliation: "Energy & Biosciences Institute, University of California, Berkeley, California, USA; Joint BioEnergy Institute, Emeryville, California, USA"
+    orcid: "https://orcid.org/0000-0003-2078-1126"
+  - given-names: "Edward"
+    family-names: "Spang"
+    affiliation: "Department of Food Science and Technology, University of California, Davis, California, USA"
+    orcid: "https://orcid.org/0000-0001-9883-078X"
+
+version: 1.0.0            
+date-released: 2026-11-06 
+license: MIT              
+
+repository-code: "https://github.com/spanglab/EXBYCost"
+url: "https://exbycost.streamlit.app/"
+
+keywords:
+  - techno-economic analysis
+  - TEA
+  - solvent extraction
+  - food processing byproducts
+  - upcycling
+  - valorization
+  - minimum selling price
+  - process simulation
+  - BioSTEAM
+  - Python
+  - Streamlit
+
+# EXBYCost is built on BioSTEAM; listing it here credits the framework.
+references:
+  - type: article
+    title: "BioSTEAM: A Fast and Flexible Platform for the Design, Simulation, and Techno-Economic Analysis of Biorefineries under Uncertainty"
+    authors:
+      - given-names: "Yoel"
+        family-names: "Cortés-Peña"
+      - given-names: "Deepak"
+        family-names: "Kumar"
+      - given-names: "Vijay"
+        family-names: "Singh"
+      - given-names: "Jeremy S."
+        family-names: "Guest"
+    journal: "ACS Sustainable Chemistry & Engineering"
+    year: 2020
+    volume: 8
+    issue: "8"
+    start: 3302
+    end: 3310
+    doi: "10.1021/acssuschemeng.9b07040"
+
